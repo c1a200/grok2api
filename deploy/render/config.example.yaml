@@ -1,0 +1,73 @@
+# Render / external PostgreSQL example for grok2api
+# Copy to a Render Secret File mounted at:
+#   /run/grok2api/config.yaml
+#
+# Generate secrets locally:
+#   openssl rand -hex 32
+#   openssl rand -base64 32
+#
+# Postgres DSN:
+# - Render managed DB: Dashboard -> grok2api-db -> Internal Database URL
+#   Append ?sslmode=require if the URL does not already include sslmode.
+# - Other providers (Neon / Supabase / RDS): paste their connection string
+#   with SSL enabled (usually sslmode=require).
+
+server:
+  listen: "0.0.0.0:8000"
+  maxBodyBytes: 33554432
+  readTimeout: 15m
+  requestTimeout: 2h
+  swaggerEnabled: false
+
+auth:
+  accessTokenTTL: 15m
+  refreshTokenTTL: 720h
+  # Render terminates TLS; cookies must be Secure.
+  secureCookies: true
+
+secrets:
+  jwtSecret: "replace-with-at-least-32-characters"
+  credentialEncryptionKey: "replace-with-base64-key"
+
+bootstrapAdmin:
+  username: "admin"
+  password: "replace-with-a-strong-password"
+
+frontend:
+  staticPath: "./frontend/dist"
+
+database:
+  driver: postgres
+  sqlite:
+    path: "./data/backend.db"
+  postgres:
+    # Example (Render internal):
+    # postgres://grok2api:xxxx@dpg-xxxxx-a/grok2api
+    # Example with explicit SSL:
+    # postgres://user:pass@host:5432/grok2api?sslmode=require
+    dsn: "postgres://USER:PASSWORD@HOST:5432/grok2api?sslmode=require"
+    maxOpenConns: 20
+    maxIdleConns: 5
+
+runtimeStore:
+  # Single Render instance: memory is enough.
+  # Scale to multiple instances only after switching this to redis.
+  driver: memory
+  redis:
+    address: "127.0.0.1:6379"
+    username: ""
+    password: ""
+    database: 0
+    keyPrefix: "grok2api:"
+    tls: false
+
+media:
+  driver: local
+  local:
+    # Must live on the Render disk mounted at /app/data
+    path: "./data/media"
+
+routing:
+  reasoningReplayEnabled: true
+  reasoningReplayTTL: 1h
+  reasoningReplayMaxEntries: 10240
