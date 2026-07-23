@@ -74,6 +74,31 @@ bootstrapAdmin:
 	}
 }
 
+func TestLoadUsesPostgresDSNFromEnvironment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const dsn = "postgresql://user:password@example.com:5432/grok2api?sslmode=require"
+	t.Setenv(PostgresDSNEnv, dsn)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "postgres" {
+		t.Fatalf("database driver = %q", cfg.Database.Driver)
+	}
+	if cfg.Database.Postgres.DSN != dsn {
+		t.Fatalf("database dsn = %q", cfg.Database.Postgres.DSN)
+	}
+}
+
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
 	if RecommendedBuildClientVersion != "0.2.106" {

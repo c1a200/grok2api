@@ -18,6 +18,7 @@ import (
 )
 
 const (
+	PostgresDSNEnv                = "GROK2API_POSTGRES_DSN"
 	StatsigModeManual             = "manual"
 	StatsigModeURL                = "url"
 	ClearanceModeManual           = "manual"
@@ -277,6 +278,7 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
+	applyEnvironmentOverrides(&cfg)
 	if loadedFrom != "" {
 		if err := resolveRelativePaths(&cfg, loadedFrom); err != nil {
 			return Config{}, err
@@ -286,6 +288,13 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func applyEnvironmentOverrides(cfg *Config) {
+	if dsn := strings.TrimSpace(os.Getenv(PostgresDSNEnv)); dsn != "" {
+		cfg.Database.Driver = "postgres"
+		cfg.Database.Postgres.DSN = dsn
+	}
 }
 
 func resolveRelativePaths(cfg *Config, configPath string) error {

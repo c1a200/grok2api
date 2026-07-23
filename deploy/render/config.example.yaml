@@ -6,11 +6,7 @@
 #   openssl rand -hex 32
 #   openssl rand -base64 32
 #
-# Postgres DSN:
-# - Render managed DB: Dashboard -> grok2api-db -> Internal Database URL
-#   Append ?sslmode=require if the URL does not already include sslmode.
-# - Other providers (Neon / Supabase / RDS): paste their connection string
-#   with SSL enabled (usually sslmode=require).
+# The Postgres DSN is read from the GROK2API_POSTGRES_DSN environment variable.
 
 server:
   listen: "0.0.0.0:8000"
@@ -41,11 +37,7 @@ database:
   sqlite:
     path: "./data/backend.db"
   postgres:
-    # Example (Render internal):
-    # postgres://grok2api:xxxx@dpg-xxxxx-a/grok2api
-    # Example with explicit SSL:
-    # postgres://user:pass@host:5432/grok2api?sslmode=require
-    dsn: "postgres://USER:PASSWORD@HOST:5432/grok2api?sslmode=require"
+    dsn: ""
     maxOpenConns: 20
     maxIdleConns: 5
 

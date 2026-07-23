@@ -1,26 +1,15 @@
-# Render Blueprint for grok2api (Docker + external PostgreSQL)
-# Docs: deploy/render/README.md
-#
-# After the first deploy:
-# 1. Copy the Postgres "Internal Database URL" into deploy/render/config.example.yaml
-# 2. Add it as a Secret File mounted at /run/grok2api/config.yaml
-# 3. Redeploy (or restart) the web service
-#
-# Optional: use any external Postgres (Neon/Supabase/RDS) instead of the
-# database defined below — then remove the databases: section and point the
-# DSN in config.yaml at that provider.
+# Render Blueprint for grok2api with an external PostgreSQL database.
+# Add GROK2API_POSTGRES_DSN as a secret environment variable in Render.
 
 services:
   - type: web
     name: grok2api
-    runtime: image
-    image:
-      url: ghcr.io/chenyme/grok2api:latest
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: starter
     region: singapore
     healthCheckPath: /healthz
-    # Official image listens on 8000 (CMD --listen 0.0.0.0:8000).
-    # Media binaries stay local; account/config state lives in Postgres.
     disk:
       name: grok2api-media
       mountPath: /app/data
@@ -28,15 +17,5 @@ services:
     envVars:
       - key: TZ
         value: Asia/Shanghai
-      # Convenience: available in the shell / logs; the app reads DSN from config.yaml.
-      - key: DATABASE_URL
-        fromDatabase:
-          name: grok2api-db
-          property: connectionString
-
-databases:
-  - name: grok2api-db
-    plan: basic-256mb
-    databaseName: grok2api
-    user: grok2api
-    region: singapore
+      - key: GROK2API_POSTGRES_DSN
+        sync: false
