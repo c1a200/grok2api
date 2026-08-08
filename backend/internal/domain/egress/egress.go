@@ -10,13 +10,16 @@ const (
 	ModePool   Mode = "pool"
 )
 
+const LastErrorTransport = "transport error"
+
 type Scope string
 
 const (
-	ScopeBuild    Scope = "grok_build"
-	ScopeWeb      Scope = "grok_web"
-	ScopeConsole  Scope = "grok_console"
-	ScopeWebAsset Scope = "grok_web_asset"
+	ScopeBuild        Scope = "grok_build"
+	ScopeWeb          Scope = "grok_web"
+	ScopeConsole      Scope = "grok_console"
+	ScopeWebAsset     Scope = "grok_web_asset"
+	ScopeConsoleAsset Scope = "grok_console_asset"
 )
 
 type Node struct {
@@ -43,6 +46,9 @@ type Node struct {
 	ProbeLatencyMS              int
 	ExitIP                      string
 	ProbeError                  string
+	ProbeProvider               ProbeProvider
+	IPv4Probe                   ProbeFamilyResult
+	IPv6Probe                   ProbeFamilyResult
 	AssignedAccountCount        int
 	CreatedAt                   time.Time
 	UpdatedAt                   time.Time
@@ -69,6 +75,9 @@ type PublicNode struct {
 	ProbeLatencyMS       int
 	ExitIP               string
 	ProbeError           string
+	ProbeProvider        ProbeProvider
+	IPv4Probe            ProbeFamilyResult
+	IPv6Probe            ProbeFamilyResult
 	AssignedAccountCount int
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
@@ -94,6 +103,19 @@ func (value ProbeStatus) IsValid() bool {
 // ProbeResult contains only operational metadata. It never stores or exposes
 // proxy credentials.
 type ProbeResult struct {
+	Status    ProbeStatus
+	TestedAt  time.Time
+	LatencyMS int
+	ExitIP    string
+	Error     string
+	Provider  ProbeProvider
+	IPv4      ProbeFamilyResult
+	IPv6      ProbeFamilyResult
+}
+
+// ProbeFamilyResult stores one address family's independent connectivity
+// result. A zero TestedAt represents a family that has not been tested yet.
+type ProbeFamilyResult struct {
 	Status    ProbeStatus
 	TestedAt  time.Time
 	LatencyMS int
@@ -169,27 +191,51 @@ type FallbackConfig struct {
 	NodeID uint64
 }
 
+type ProbeProvider string
+
+const (
+	ProbeProviderIPInfo     ProbeProvider = "ipinfo"
+	ProbeProviderCloudflare ProbeProvider = "cloudflare"
+)
+
+func (value ProbeProvider) IsValid() bool {
+	return value == ProbeProviderIPInfo || value == ProbeProviderCloudflare
+}
+
+func (value ProbeProvider) Normalized() ProbeProvider {
+	if !value.IsValid() {
+		return ProbeProviderCloudflare
+	}
+	return value
+}
+
 // OperationsConfig controls background probe, account assignment, and egress
 // fallback work. It defaults to a conservative disabled state for mutations
 // and fallback routing.
 type OperationsConfig struct {
+	ProbeProvider             ProbeProvider
 	ProbeIntervalSeconds      int
 	AutoAssignEnabled         bool
 	AutoBalanceEnabled        bool
 	AssignmentIntervalSeconds int
-	Fallbacks                 map[Scope]FallbackConfig
-	UpdatedAt                 time.Time
+	// EncryptedSubscriptionProxyURL is the optional proxy used only when
+	// fetching remote proxy subscription sources. It is write-only at rest.
+	EncryptedSubscriptionProxyURL string
+	Fallbacks                     map[Scope]FallbackConfig
+	UpdatedAt                     time.Time
 }
 
 func DefaultOperationsConfig() OperationsConfig {
 	return OperationsConfig{
+		ProbeProvider:             ProbeProviderCloudflare,
 		ProbeIntervalSeconds:      900,
 		AssignmentIntervalSeconds: 300,
 		Fallbacks: map[Scope]FallbackConfig{
-			ScopeBuild:    {Mode: FallbackModeNone},
-			ScopeWeb:      {Mode: FallbackModeNone},
-			ScopeConsole:  {Mode: FallbackModeNone},
-			ScopeWebAsset: {Mode: FallbackModeNone},
+			ScopeBuild:        {Mode: FallbackModeNone},
+			ScopeWeb:          {Mode: FallbackModeNone},
+			ScopeConsole:      {Mode: FallbackModeNone},
+			ScopeWebAsset:     {Mode: FallbackModeNone},
+			ScopeConsoleAsset: {Mode: FallbackModeNone},
 		},
 	}
 }
@@ -206,11 +252,19 @@ func (value OperationsConfig) FallbackFor(scope Scope) FallbackConfig {
 }
 
 // SupportsScope reports whether a node can serve requests for the supplied
-// scope. Console may intentionally reuse a Web browser proxy, and Web assets
-// inherit a Web node when no asset-specific node is required.
+// scope. Console may intentionally reuse a Web browser proxy. Resource scopes
+// may reuse their provider's primary node so explicit account bindings remain
+// authoritative when no independently bound resource identity exists.
 func SupportsScope(nodeScope, requestScope Scope) bool {
 	if nodeScope == requestScope {
 		return true
 	}
-	return (requestScope == ScopeWebAsset || requestScope == ScopeConsole) && nodeScope == ScopeWeb
+	switch requestScope {
+	case ScopeWebAsset, ScopeConsole:
+		return nodeScope == ScopeWeb
+	case ScopeConsoleAsset:
+		return nodeScope == ScopeConsole || nodeScope == ScopeWeb
+	default:
+		return false
+	}
 }

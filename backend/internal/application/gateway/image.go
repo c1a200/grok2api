@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -165,20 +166,28 @@ func (s *Service) executeImage(
 		}
 	}()
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
-	attempts := int(s.maxAttempts.Load())
-	if attempts <= 0 {
-		attempts = 3
-	}
+	attemptPolicy := newRoutingAttemptPolicy(int(s.maxAttempts.Load()))
 	excluded := make(map[uint64]bool)
+	var selection *selectionSession
 	var lease *accountLease
 	var credential accountdomain.Credential
 	var response *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
-	for attempt := 0; attempt < attempts; attempt++ {
-		lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false)
+	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
+		if selection == nil {
+			selection, err = s.selector.beginSelectionSessionForKey(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, key.AccountScope())
+		}
+		if err == nil {
+			lease, err = selection.Acquire(ctx, excluded, false)
+		}
 		if err != nil {
-			writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
+			errorCode := "upstream_unavailable"
+			var selectionFailure *SelectionUnavailableError
+			if errors.As(err, &selectionFailure) {
+				errorCode = selectionFailure.Code()
+			}
+			writeFailureAudit(http.StatusServiceUnavailable, errorCode, lastCredentialFailure)
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 		}
 		excluded[lease.Credential.ID] = true
@@ -224,20 +233,23 @@ func (s *Service) executeImage(
 			lease.Release()
 			continue
 		}
-		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attempt+1 < attempts {
+		if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attempt == 0 && attemptPolicy.hasNext(attempt) {
 			_, _ = readRetryableBody(response.Body)
-			lease.Release()
 			delete(excluded, credential.ID)
+			if selection != nil {
+				selection.RetryAccount(credential.ID)
+			}
+			lease.Release()
 			continue
 		}
 		if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-			s.selector.MarkQuotaStateChanged(credential.Provider)
+			s.selector.MarkQuotaStateChanged(credential.Provider, credential.ID)
 			if reconcileErr != nil || !exhausted {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
-			if attempt+1 < attempts {
+			if attemptPolicy.hasNext(attempt) {
 				_, _ = readRetryableBody(response.Body)
 				lease.Release()
 				continue
@@ -257,7 +269,7 @@ func (s *Service) executeImage(
 	var once sync.Once
 	finalize := func(_ Usage, _ string, errorCode string) {
 		once.Do(func() {
-			successful := response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == ""
+			successful := auditRequestSucceeded(response.StatusCode, errorCode)
 			lease.completeSelectorObservation(successful)
 			lease.Release()
 			budget := newFinalizationBudget(string(operation), string(route.Provider))

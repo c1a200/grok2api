@@ -4,11 +4,137 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 )
+
+func TestLoadDatabaseURLOverridesYAMLAndSelectsPostgres(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+database:
+  driver: sqlite
+  sqlite:
+    path: "./yaml.db"
+  postgres:
+    dsn: "postgres://yaml:yaml@yaml.invalid/yaml"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const environmentDSN = "postgresql://env:secret@postgres.internal:5432/grok2api?sslmode=require"
+	t.Setenv(DatabaseURLEnv, environmentDSN)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "postgres" || cfg.Database.Postgres.DSN != environmentDSN {
+		t.Fatalf("database config = %#v", cfg.Database)
+	}
+}
+
+func TestLoadUsesPostgresDSNEnvAlias(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const dsn = "postgresql://user:password@example.com:5432/grok2api?sslmode=require"
+	t.Setenv(DatabaseURLEnv, "")
+	t.Setenv(PostgresDSNEnv, dsn)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "postgres" {
+		t.Fatalf("database driver = %q", cfg.Database.Driver)
+	}
+	if cfg.Database.Postgres.DSN != dsn {
+		t.Fatalf("database dsn = %q", cfg.Database.Postgres.DSN)
+	}
+}
+
+func TestLoadEmptyDatabaseURLKeepsYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	const yamlDSN = "postgres://yaml:secret@postgres.internal:5432/grok2api"
+	if err := os.WriteFile(path, []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+database:
+  driver: postgres
+  postgres:
+    dsn: "`+yamlDSN+`"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(DatabaseURLEnv, "   ")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "postgres" || cfg.Database.Postgres.DSN != yamlDSN {
+		t.Fatalf("database config = %#v", cfg.Database)
+	}
+}
+
+func TestLoadDoesNotImplicitlyReadGenericDatabaseURL(t *testing.T) {
+	t.Setenv(DatabaseURLEnv, "")
+	t.Setenv("DATABASE_URL", "postgres://generic:secret@postgres.internal/grok2api")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.Driver != "sqlite" {
+		t.Fatalf("generic DATABASE_URL unexpectedly selected %q", cfg.Database.Driver)
+	}
+}
+
+func TestLoadRejectsInvalidDatabaseEnvironmentURLWithoutLeakingCredentials(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		message string
+	}{
+		{name: "asyncpg", value: "postgresql+asyncpg://user:highly-secret@postgres.internal/grok2api", message: "改为 postgresql://"},
+		{name: "unsupported scheme", value: "mysql://user:highly-secret@mysql.internal/grok2api", message: "postgres:// 或 postgresql://"},
+		{name: "malformed URL", value: "postgres://user:highly-secret%zz@postgres.internal/grok2api", message: "不是有效的 PostgreSQL URL"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(DatabaseURLEnv, test.value)
+			_, err := Load("")
+			if err == nil || !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("Load error = %v, want message containing %q", err, test.message)
+			}
+			if strings.Contains(err.Error(), "highly-secret") || strings.Contains(err.Error(), test.value) {
+				t.Fatalf("Load error leaked database credentials: %v", err)
+			}
+		})
+	}
+}
 
 func TestLoadDurationAndSecretsFromYAML(t *testing.T) {
 	dir := t.TempDir()
@@ -89,28 +215,41 @@ bootstrapAdmin:
 	}
 }
 
-func TestLoadUsesPostgresDSNFromEnvironment(t *testing.T) {
+func TestLoadQualityGuardFromYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte(`secrets:
   jwtSecret: "12345678901234567890123456789012"
   credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+bootstrapAdmin:
+  password: "password123"
+qualityGuard:
+  enabled: true
+  clientKeyID: 999
+  model: "grok-4.5"
+  nodeIDs: [2, 9]
+  minimumHealthyNodes: 1
+  activeInterval: 45m
 `)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-
-	const dsn = "postgresql://user:password@example.com:5432/grok2api?sslmode=require"
-	t.Setenv(PostgresDSNEnv, dsn)
-
-	cfg, err := Load(path)
+	value, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Database.Driver != "postgres" {
-		t.Fatalf("database driver = %q", cfg.Database.Driver)
+	if !value.QualityGuard.Enabled || value.QualityGuard.DeprecatedClientKeyID != 999 || value.QualityGuard.ActiveInterval.Value() != 45*time.Minute {
+		t.Fatalf("qualityGuard = %#v", value.QualityGuard)
 	}
-	if cfg.Database.Postgres.DSN != dsn {
-		t.Fatalf("database dsn = %q", cfg.Database.Postgres.DSN)
+}
+
+func TestEnabledQualityGuardUsesManagedIdentity(t *testing.T) {
+	value := defaultConfig()
+	value.Secrets.JWTSecret = "12345678901234567890123456789012"
+	value.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	value.BootstrapAdmin.Password = "password123"
+	value.QualityGuard.Enabled = true
+	if err := value.Validate(); err != nil {
+		t.Fatalf("enabled quality guard should not require a client key ID: %v", err)
 	}
 }
 
@@ -126,17 +265,39 @@ func TestBuildResponseHeaderTimeoutIsRuntimeOnly(t *testing.T) {
 
 func TestDefaultGrokBuildClientVersionMatchesLocalBaseline(t *testing.T) {
 	build := defaultConfig().Provider.Build
-	if RecommendedBuildClientVersion != "0.2.111" {
+	if RecommendedBuildClientVersion != "0.2.119" {
 		t.Fatalf("recommended clientVersion = %q", RecommendedBuildClientVersion)
 	}
 	if build.ClientVersion != RecommendedBuildClientVersion {
 		t.Fatalf("clientVersion = %q", build.ClientVersion)
 	}
-	if RecommendedBuildUserAgent != "grok-shell/0.2.111 (linux; x86_64)" {
+	if RecommendedBuildUserAgent != "grok-shell/0.2.119 (linux; x86_64)" {
 		t.Fatalf("recommended userAgent = %q", RecommendedBuildUserAgent)
 	}
 	if build.UserAgent != RecommendedBuildUserAgent {
 		t.Fatalf("userAgent = %q", build.UserAgent)
+	}
+}
+
+func TestLoadKeepsExplicitGrokBuildClientFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`provider:
+  build:
+    clientVersion: "0.2.111"
+    userAgent: "grok-shell/0.2.111 (linux; x86_64)"
+secrets:
+  jwtSecret: "12345678901234567890123456789012"
+  credentialEncryptionKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider.Build.ClientVersion != "0.2.111" || cfg.Provider.Build.UserAgent != "grok-shell/0.2.111 (linux; x86_64)" {
+		t.Fatalf("explicit Build fingerprint was overwritten: %#v", cfg.Provider.Build)
 	}
 }
 
@@ -190,6 +351,51 @@ routing:
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("unknown field was accepted")
+	}
+}
+
+func TestRoutingMaxAttemptsSupportsLargeCredentialPools(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	if cfg.Routing.MaxAttempts != 999 {
+		t.Fatalf("default max attempts = %d, want 999", cfg.Routing.MaxAttempts)
+	}
+	if cfg.Routing.CapacityWait.Value() != 500*time.Millisecond {
+		t.Fatalf("default capacity wait = %s, want 500ms", cfg.Routing.CapacityWait.Value())
+	}
+	if cfg.Provider.Web.ChatTimeout.Value() != 2*time.Minute {
+		t.Fatalf("default web chat timeout = %s, want 2m", cfg.Provider.Web.ChatTimeout.Value())
+	}
+	cfg.Routing.MaxAttempts = 65535
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("65535 attempts should be valid: %v", err)
+	}
+	cfg.Routing.MaxAttempts = 65536
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("65536 attempts should be rejected")
+	}
+	cfg.Routing.MaxAttempts = 999
+	cfg.Routing.CapacityWait = Duration(30 * time.Second)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("30s capacity wait should be valid: %v", err)
+	}
+	cfg.Routing.CapacityWait = Duration(31 * time.Second)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("31s capacity wait should be rejected")
+	}
+	cfg.Routing.CapacityWait = Duration(500 * time.Millisecond)
+	cfg.Routing.MaxAttempts = -1
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unlimited attempts should be valid: %v", err)
+	}
+	cfg.Routing.MaxAttempts = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("zero attempts should be rejected")
+	}
+	cfg.Routing.MaxAttempts = -2
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("values below unlimited sentinel should be rejected")
 	}
 }
 

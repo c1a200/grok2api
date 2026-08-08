@@ -126,6 +126,14 @@ func TestEstimateOfficialImageEditCost(t *testing.T) {
 	if result, ok = EstimateOfficialImageEditCost("grok-imagine-image-edit", "4k", 1, 1); ok || result.CostInUSDTicks != 0 {
 		t.Fatalf("unknown edit resolution = %#v, ok = %v", result, ok)
 	}
+	result, ok = EstimateOfficialImageEditCost("Console/grok-imagine-image-quality", "2k", 1, 2)
+	if !ok || result.Model != "grok-imagine-image-quality-edit-2k" || result.CostInUSDTicks != 900_000_000 {
+		t.Fatalf("Console quality edit price = %#v, ok = %v", result, ok)
+	}
+	result, ok = EstimateOfficialImageEditCost("Console/grok-imagine-image", "1k", 1, 2)
+	if !ok || result.Model != "grok-imagine-image-edit-lite-1k" || result.CostInUSDTicks != 240_000_000 {
+		t.Fatalf("Console lite edit price = %#v, ok = %v", result, ok)
+	}
 }
 
 func TestEstimateOfficialVideoCost(t *testing.T) {
@@ -154,5 +162,24 @@ func TestEstimateOfficialVideoCost(t *testing.T) {
 	}
 	if result, ok = EstimateOfficialVideoCost("grok-imagine-video-2.0", "720p", 6); ok || result.CostInUSDTicks != 0 {
 		t.Fatalf("unknown video model was priced = %#v, ok = %v", result, ok)
+	}
+}
+
+func TestReconstructOfficialCostReturnsExactStoredFormulaInputs(t *testing.T) {
+	textResult, ok := ReconstructOfficialCost("grok-build-0.1", 100, 20, 50, 100, 0, 0, 0)
+	if !ok || textResult.Tier != PricingTierStandard || textResult.CostInUSDTicks != 1_840_000 || len(textResult.Components) != 3 {
+		t.Fatalf("text reconstruction = %#v, %v", textResult, ok)
+	}
+	longResult, ok := ReconstructOfficialCost("grok-build-0.1", 100, 20, 50, 200_001, 0, 0, 0)
+	if !ok || longResult.Tier != PricingTierLongContext || longResult.CostInUSDTicks != 3_680_000 {
+		t.Fatalf("long-context reconstruction = %#v, %v", longResult, ok)
+	}
+	imageResult, ok := ReconstructOfficialCost("grok-imagine-image-edit-2k", 0, 0, 0, 0, 2, 3, 0)
+	if !ok || imageResult.CostInUSDTicks != 2_300_000_000 || len(imageResult.Components) != 2 || imageResult.Components[1].Kind != PricingComponentInputImage {
+		t.Fatalf("image reconstruction = %#v, %v", imageResult, ok)
+	}
+	videoResult, ok := ReconstructOfficialCost("grok-imagine-video-1.5-720p", 0, 0, 0, 0, 1, 0, 6)
+	if !ok || videoResult.CostInUSDTicks != 8_400_000_000 || videoResult.Components[0].Unit != PricingUnitSecond {
+		t.Fatalf("video reconstruction = %#v, %v", videoResult, ok)
 	}
 }

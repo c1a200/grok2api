@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
@@ -98,7 +99,8 @@ func (a *Adapter) SetReasoningReplay(replay *reasoningreplay.ReasoningReplay) {
 func (a *Adapter) Provider() account.Provider { return account.ProviderBuild }
 
 // CredentialMetadata extracts only non-sensitive risk flags from a Build access token.
-// bot_flag_source must be JSON number 1; other values, malformed tokens, and decryption failures are not marked.
+// bot_flag_source or its short alias bfs must be JSON number 1 or 2; other values, malformed
+// tokens, and decryption failures are not marked. bot_flag_source is preferred when both are set.
 func (a *Adapter) CredentialMetadata(credential account.Credential) provider.CredentialMetadata {
 	if credential.Provider != account.ProviderBuild || a.cipher == nil || credential.EncryptedAccessToken == "" {
 		return provider.CredentialMetadata{}
@@ -107,8 +109,47 @@ func (a *Adapter) CredentialMetadata(credential account.Credential) provider.Cre
 	if err != nil {
 		return provider.CredentialMetadata{}
 	}
-	value, ok := decodeJWTClaims(accessToken)["bot_flag_source"].(float64)
-	return provider.CredentialMetadata{BuildBotFlagged: ok && value == 1}
+	claims := decodeJWTClaims(accessToken)
+	if claims == nil {
+		return provider.CredentialMetadata{}
+	}
+	source := buildBotFlagSourceFromClaims(claims)
+	return provider.CredentialMetadata{
+		BuildBotFlagInspected: true,
+		BuildBotFlagged:       source != 0,
+		BuildBotFlagSource:    source,
+	}
+}
+
+// buildBotFlagSourceFromClaims returns the bot-risk source from JWT claims.
+// Accepts bot_flag_source or bfs; only JSON numbers 1 and 2 count (string "1"/"2" do not).
+// Prefer bot_flag_source when it is 1 or 2; otherwise fall back to bfs.
+func buildBotFlagSourceFromClaims(claims map[string]any) int {
+	if claims == nil {
+		return 0
+	}
+	if source := botFlagSourceClaim(claims, "bot_flag_source"); source != 0 {
+		return source
+	}
+	return botFlagSourceClaim(claims, "bfs")
+}
+
+func botFlagSourceClaim(claims map[string]any, key string) int {
+	value, ok := claims[key].(float64)
+	if !ok {
+		return 0
+	}
+	switch value {
+	case 1, 2:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+// buildBotFlaggedFromClaims reports whether JWT claims mark a Build account as bot-risked.
+func buildBotFlaggedFromClaims(claims map[string]any) bool {
+	return buildBotFlagSourceFromClaims(claims) != 0
 }
 
 func (a *Adapter) UpdateConfig(cfg Config) {
@@ -200,7 +241,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 			return invalidResponsesResponse(err), nil
 		}
-		body, err = normalizeBuildReasoningEffort(body)
+		body, err = normalizeBuildRequest(body, request.Model)
 		if err != nil {
 			if request.Operation == conversation.OperationChat || request.Operation == conversation.OperationMessages {
 				return invalidConversationResponse(request.Operation, err), nil
@@ -245,7 +286,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 		return a.forwardGatewayCompaction(ctx, request, accessToken, body, warnings)
 	}
-	// Explicit mode wins; in auto mode only confirmed Super accounts with bot_flag_source=1 default to XAI.
+	// Explicit mode wins; in auto mode only confirmed Super accounts with bot_flag_source/bfs in {1,2} default to XAI.
 	primaryBase := a.primaryBaseURL()
 	base := a.inferenceBaseForOperation(request.Credential, request.Billing, request.Method, request.Path)
 	// Cache affinity and reasoning replay use separate identities. Replay is also bound to the actual account and upstream plane,
@@ -270,7 +311,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			return nil, readErr
 		}
 		primaryResp := cloneBufferedResponse(resp, primaryBody, primaryTruncated)
-		if isDefinitiveAccountBlockBody(primaryBody) {
+		if shouldSkipXAIFallback(primaryBody) {
 			resp = primaryResp
 		} else {
 			fallbackBase := a.fallbackBaseURL()
@@ -302,6 +343,25 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 		}
 	}
+	var rateLimit *provider.RateLimitMetadata
+	var rateLimitDiagnostic *provider.DiagnosticResponse
+	if resp.StatusCode == http.StatusTooManyRequests {
+		body, truncated, readErr := provider.ReadDiagnosticBody(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		rateLimit = provider.RateLimitFromResponse(resp.StatusCode, resp.Header, body)
+		if truncated {
+			rateLimitDiagnostic = &provider.DiagnosticResponse{
+				StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(),
+				Body: append([]byte(nil), body...), BodyTruncated: true,
+			}
+		}
+	}
 	modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
 	// Capture or clear reasoning replay in the upstream Responses shape before protocol conversion.
 	if a.shouldCaptureReplay(request, resp, replayKey) {
@@ -321,12 +381,12 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		}
 	}
 	reasoningRecovery.appendWarnings(resp.Header)
-	if responsesOperation && toolCompatibility != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+	if responsesOperation && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		if request.Streaming {
 			resp.Body = toolCompatibility.normalizeResponseStream(resp.Body)
 			resp.Header.Del("Content-Length")
 			resp.Header.Set("Content-Type", "text/event-stream")
-		} else {
+		} else if toolCompatibility != nil {
 			data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxCompatibleResponseBytes+1))
 			_ = resp.Body.Close()
 			if readErr != nil {
@@ -367,22 +427,22 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 			}
 			var diagnostic *provider.DiagnosticResponse
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				diagnostic = &provider.DiagnosticResponse{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: data, BodyTruncated: diagnosticTruncated}
+				diagnostic = &provider.DiagnosticResponse{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: data, BodyTruncated: diagnosticTruncated || rateLimitDiagnostic != nil}
 			}
 			converted, convertErr := conversation.ConvertResponseJSONWithOptions(data, request.Operation, conversationOptions)
 			if convertErr != nil {
 				if diagnostic == nil {
 					return nil, convertErr
 				}
-				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, ModelCatalogChanged: modelCatalogChanged}, nil
+				return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: diagnostic.Header.Clone(), Body: io.NopCloser(bytes.NewReader(data)), UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(converted))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(converted)))
 			resp.Header.Set("Content-Type", "application/json")
-			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, ModelCatalogChanged: modelCatalogChanged}, nil
+			return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: diagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 		}
 	}
-	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, RecoveredPrimaryFailure: recoveredPrimaryFailure, ModelCatalogChanged: modelCatalogChanged}, nil
+	return &provider.Response{StatusCode: resp.StatusCode, Status: resp.Status, Header: resp.Header.Clone(), Body: resp.Body, UpstreamURL: reqURL, Diagnostic: rateLimitDiagnostic, RecoveredPrimaryFailure: recoveredPrimaryFailure, RateLimit: rateLimit, ModelCatalogChanged: modelCatalogChanged}, nil
 }
 
 func (a *Adapter) shouldCaptureReplay(request provider.ResponseResourceRequest, resp *http.Response, replayKey string) bool {
@@ -436,6 +496,9 @@ func (a *Adapter) doResponseRequest(ctx context.Context, request provider.Respon
 		bodyReader = bytes.NewReader(body)
 	}
 	requestCtx := infraegress.WithCredential(ctx, request.Credential)
+	if request.ForcedEgressNodeID != 0 {
+		requestCtx = infraegress.WithEgressNode(requestCtx, request.ForcedEgressNodeID)
+	}
 	plane := "build"
 	if fallback := a.fallbackBaseURL(); fallback != "" && strings.EqualFold(strings.TrimRight(base, "/"), fallback) {
 		plane = "xai"
@@ -541,7 +604,8 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 		return nil, err
 	}
 	// Always request the model catalog from the Build primary; do not preemptively switch to XAI because 1.5 or Super entitlement is absent.
-	// NormalizeAccountModelCapabilities fills 1.5 locally from Billing paid or BuildSuperEntitled.
+	// NormalizeAccountModelCapabilities fills session-contract capabilities such
+	// as Composer and paid video entitlement locally.
 	models, status, err := a.listModelsAt(ctx, credential, accessToken, a.primaryBaseURL())
 	if err != nil {
 		return nil, err
@@ -552,12 +616,16 @@ func (a *Adapter) ListModels(ctx context.Context, credential account.Credential)
 	return nil, fmt.Errorf("上游模型接口返回 %d", status)
 }
 
-// NormalizeAccountModelCapabilities normalizes 1.5 video entitlement from Super (Billing paid or BuildSuperEntitled).
-// Super always includes grok-imagine-video-1.5; Free and Unknown remove it exactly. BuildAPIFallback is ignored.
+// NormalizeAccountModelCapabilities normalizes capabilities that the OAuth
+// session contract exposes independently of the account's sparse /models list.
+// Composer is available to Build OAuth sessions even though the live catalog can
+// return only grok-4.5. Super always includes video 1.5; Free and Unknown remove
+// video 1.5 exactly. BuildAPIFallback is ignored.
 func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *account.Billing, credential account.Credential) []string {
 	super := account.IsBuildSuper(credential, billing)
-	result := make([]string, 0, len(models)+1)
-	seen := make(map[string]struct{}, len(models)+1)
+	composer := credential.Provider == account.ProviderBuild && credential.AuthType == account.AuthTypeOAuth
+	result := make([]string, 0, len(models)+2)
+	seen := make(map[string]struct{}, len(models)+2)
 	hasVideo15 := false
 	for _, model := range models {
 		model = strings.TrimSpace(model)
@@ -579,7 +647,35 @@ func (a *Adapter) NormalizeAccountModelCapabilities(models []string, billing *ac
 	if super && !hasVideo15 {
 		result = append(result, buildVideoModel)
 	}
+	if composer {
+		if _, exists := seen[modeldomain.GrokComposer25Fast]; !exists {
+			result = append(result, modeldomain.GrokComposer25Fast)
+		}
+	}
 	return result
+}
+
+type buildModelCatalogEntry struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	ModelID string `json:"modelId"`
+	Hidden  bool   `json:"hidden"`
+	Meta    struct {
+		Model   string `json:"model"`
+		ModelID string `json:"modelId"`
+		Hidden  bool   `json:"hidden"`
+	} `json:"_meta"`
+}
+
+// modelIdentifier keeps the legacy top-level id authoritative and uses the
+// additional official Grok Build shapes only as fallbacks. This makes catalog
+// parsing additive: existing route IDs never change merely because model or
+// modelId metadata appears alongside id.
+func (e buildModelCatalogEntry) modelIdentifier() string {
+	if e.Hidden || e.Meta.Hidden {
+		return ""
+	}
+	return firstNonEmpty(e.ID, e.Model, e.ModelID, e.Meta.Model, e.Meta.ModelID)
 }
 
 func (a *Adapter) listModelsAt(ctx context.Context, credential account.Credential, accessToken, base string) ([]string, int, error) {
@@ -607,18 +703,27 @@ func (a *Adapter) listModelsAt(ctx context.Context, credential account.Credentia
 		return nil, resp.StatusCode, nil
 	}
 	var payload struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, resp.StatusCode, err
 	}
 	models := make([]string, 0, len(payload.Data))
-	for _, item := range payload.Data {
-		if item.ID != "" {
-			models = append(models, item.ID)
+	seen := make(map[string]struct{}, len(payload.Data))
+	for _, raw := range payload.Data {
+		var item buildModelCatalogEntry
+		if json.Unmarshal(raw, &item) != nil {
+			continue
 		}
+		identifier := item.modelIdentifier()
+		if identifier == "" {
+			continue
+		}
+		if _, exists := seen[identifier]; exists {
+			continue
+		}
+		seen[identifier] = struct{}{}
+		models = append(models, identifier)
 	}
 	a.recordModelsETag(credential.ID, resp.Header.Get("ETag"))
 	return models, resp.StatusCode, nil
@@ -687,10 +792,10 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 		// Decryption failures are usually temporary or mismatched local encryption keys and are recoverable;
 		// do not mark them permanent, or manual/batch refresh will never retry after the key is fixed.
 		// True permanent OAuth failures such as invalid_grant are returned by oauth.refresh with Permanent=true.
-		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Permanent: false, Cause: err}
+		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Message: "Stored refresh credential could not be decrypted", Permanent: false, Cause: err}
 	}
 	if strings.TrimSpace(refreshToken) == "" {
-		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Permanent: true}
+		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Message: "Refresh token is missing", Permanent: true}
 	}
 	refreshCtx := infraegress.WithCredential(ctx, credential)
 	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)

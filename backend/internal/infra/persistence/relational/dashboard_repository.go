@@ -17,7 +17,20 @@ type DashboardRepository struct{ db *Database }
 
 func NewDashboardRepository(db *Database) *DashboardRepository { return &DashboardRepository{db: db} }
 
-const dashboardUsageAggregateSelect = "COUNT(*) AS requests, COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(CASE WHEN status_code < 200 OR status_code >= 300 THEN 1 ELSE 0 END), 0) AS failed_requests, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(CASE WHEN cost_in_usd_ticks > 0 THEN cost_in_usd_ticks ELSE estimated_cost_in_usd_ticks END), 0) AS billed_cost_usd_ticks"
+const dashboardUsageAggregateSelect = `
+	COUNT(*) AS requests,
+	` + auditSuccessAggregate + ` AS successful_requests,
+	COALESCE(SUM(input_tokens), 0) AS input_tokens,
+	COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+	COALESCE(SUM(output_tokens), 0) AS output_tokens,
+	COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+	COALESCE(SUM(total_tokens), 0) AS tokens,
+	COALESCE(SUM(CASE WHEN cost_in_usd_ticks > 0 THEN cost_in_usd_ticks ELSE estimated_cost_in_usd_ticks END), 0) AS billed_cost_usd_ticks,
+	COUNT(first_token_ms) AS first_token_samples,
+	COALESCE(SUM(first_token_ms), 0) AS first_token_total_ms,
+	COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL AND output_tokens > 0 AND duration_ms > first_token_ms THEN 1 ELSE 0 END), 0) AS throughput_samples,
+	COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL AND output_tokens > 0 AND duration_ms > first_token_ms THEN output_tokens ELSE 0 END), 0) AS throughput_tokens,
+	COALESCE(SUM(CASE WHEN first_token_ms IS NOT NULL AND output_tokens > 0 AND duration_ms > first_token_ms THEN duration_ms - first_token_ms ELSE 0 END), 0) AS generation_total_ms`
 
 const dashboardTopModelsLimit = 10
 
@@ -63,7 +76,7 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 			Total  int64
 			Active int64
 		}
-		if err := tx.Model(&clientKeyModel{}).
+		if err := tx.Model(&clientKeyModel{}).Where("internal_kind IS NULL").
 			Select("COUNT(*) AS total, COALESCE(SUM(CASE WHEN enabled = ? AND (expires_at IS NULL OR expires_at > ?) THEN 1 ELSE 0 END), 0) AS active", true, snapshotAt).
 			Scan(&clientKeys).Error; err != nil {
 			return err
@@ -85,6 +98,7 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 			Scan(&result.Usage).Error; err != nil {
 			return err
 		}
+		result.Usage.FailedRequests = result.Usage.Requests - result.Usage.SuccessfulRequests
 		var buckets []struct {
 			BucketIndex        int `gorm:"column:bucket_index"`
 			Requests           int64
@@ -132,7 +146,7 @@ func (r *DashboardRepository) Snapshot(ctx context.Context, window repository.Da
 			Tokens             int64
 		}
 		if err := tx.Model(&requestAuditModel{}).
-			Select("provider, COUNT(*) AS requests, COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0) AS successful_requests, COALESCE(SUM(total_tokens), 0) AS tokens").
+			Select("provider, COUNT(*) AS requests, "+auditSuccessAggregate+" AS successful_requests, COALESCE(SUM(total_tokens), 0) AS tokens").
 			Where("created_at >= ? AND created_at < ?", start, end).
 			Group("provider").
 			Order("requests DESC, provider ASC").

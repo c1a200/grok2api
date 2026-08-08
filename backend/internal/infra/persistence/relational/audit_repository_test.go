@@ -444,14 +444,15 @@ func TestAuditRepositoryNormalizesUntrustedUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	repository := NewAuditRepository(database)
-	if err := repository.Create(ctx, audit.Record{RequestID: "normalize", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200, MediaInputImages: -1, MediaOutputImages: -2, MediaOutputSeconds: -3, InputTokens: -1, TotalTokens: -2, DurationMS: -3, CreatedAt: time.Now().UTC()}); err != nil {
+	negativeFirstToken := int64(-4)
+	if err := repository.Create(ctx, audit.Record{RequestID: "normalize", ClientKeyID: 1, ModelRouteID: 1, StatusCode: 200, Streaming: true, MediaInputImages: -1, MediaOutputImages: -2, MediaOutputSeconds: -3, InputTokens: -1, TotalTokens: -2, FirstTokenMS: &negativeFirstToken, DurationMS: -3, CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	values, _, err := repository.List(ctx, 0, 1)
 	if err != nil || len(values) != 1 {
 		t.Fatalf("values = %#v, err = %v", values, err)
 	}
-	if values[0].MediaInputImages != 0 || values[0].MediaOutputImages != 0 || values[0].MediaOutputSeconds != 0 || values[0].InputTokens != 0 || values[0].TotalTokens != 0 || values[0].DurationMS != 0 {
+	if values[0].MediaInputImages != 0 || values[0].MediaOutputImages != 0 || values[0].MediaOutputSeconds != 0 || values[0].InputTokens != 0 || values[0].TotalTokens != 0 || values[0].FirstTokenMS == nil || *values[0].FirstTokenMS != 0 || values[0].DurationMS != 0 {
 		t.Fatalf("normalized audit = %#v", values[0])
 	}
 }
@@ -485,6 +486,55 @@ func TestAuditRepositorySummaryAppliesRangeAndGroupsPricingTier(t *testing.T) {
 	}
 	if summary.EstimatedCostInUSDTicks != 1_840_000 || summary.PricedRequests != 1 || summary.UnpricedRequests != 1 || summary.PricedTokens != 150 || summary.UnpricedTokens != 210_100 {
 		t.Fatalf("summary pricing = %#v", summary)
+	}
+}
+
+func TestAuditRepositoryStreamFailureKeepsHTTPStatusAndFiltersAsOther(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-stream-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewAuditRepository(database)
+	now := time.Now().UTC()
+	values := []audit.Record{
+		{RequestID: "stream-interrupted", ClientKeyID: 1, ModelRouteID: 1, ModelPublicID: "public", StatusCode: 200, Streaming: true, ErrorCode: "upstream_stream_interrupted", DurationMS: 616_731, CreatedAt: now.Add(-time.Hour)},
+		{RequestID: "healthy", ClientKeyID: 1, ModelRouteID: 1, ModelPublicID: "public", StatusCode: 200, Streaming: true, InputTokens: 100, OutputTokens: 50, TotalTokens: 150, DurationMS: 100, CreatedAt: now.Add(-2 * time.Hour)},
+		{RequestID: "server-error", ClientKeyID: 1, ModelRouteID: 1, ModelPublicID: "public", StatusCode: 500, ErrorCode: "upstream_server_error", DurationMS: 50, CreatedAt: now.Add(-3 * time.Hour)},
+	}
+	if err := repository.CreateBatch(ctx, values); err != nil {
+		t.Fatal(err)
+	}
+	// 真实 HTTP 200 被保留，但带 error_code 的流式记录计入失败。
+	summary, err := repository.Summarize(ctx, repositorypkg.AuditSummaryQuery{Start: now.Add(-24 * time.Hour), End: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Requests != 3 || summary.SuccessfulRequests != 1 || summary.FailedRequests != 2 {
+		t.Fatalf("summary = %#v", summary)
+	}
+	// "其它错误"筛选通过 error_code 命中 2xx 响应头之后的流失败。
+	items, _, err := repository.ListCursor(ctx, repositorypkg.AuditCursorQuery{Limit: 50, Filter: repositorypkg.AuditListFilter{Status: "other"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].RequestID != "stream-interrupted" {
+		t.Fatalf("other filter items = %#v", items)
+	}
+	if items[0].StatusCode != 200 {
+		t.Fatalf("stream failure status = %d, want original HTTP 200", items[0].StatusCode)
+	}
+	// "成功"筛选排除带错误码的记录。
+	items, _, err = repository.ListCursor(ctx, repositorypkg.AuditCursorQuery{Limit: 50, Filter: repositorypkg.AuditListFilter{Status: "success"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].RequestID != "healthy" {
+		t.Fatalf("success filter items = %#v", items)
 	}
 }
 

@@ -76,6 +76,28 @@ func TestSegmentedActiveReadsOnlyFirstAvailableWindow(t *testing.T) {
 	}
 }
 
+func TestSelectionSessionUsesSegmentedActiveWindow(t *testing.T) {
+	limiter := newSegmentedSelectiveLimiter()
+	selector := newSegmentedActiveTestSelector(100, limiter, nil)
+	selector.UpdateSegmentedSelector(true, 100, 8)
+
+	session, err := selector.beginSelectionSession(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := session.Acquire(context.Background(), nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if sizes := limiter.BatchSizes(); fmt.Sprint(sizes) != "[8]" {
+		t.Fatalf("selection session concurrency batch sizes = %v, want one window", sizes)
+	}
+	if observation := lease.selectorObservation; observation == nil || observation.stage != "first_window" {
+		t.Fatalf("selection session active observation = %#v", observation)
+	}
+}
+
 func TestSegmentedActiveCursorIsIndependentPerRouteShard(t *testing.T) {
 	selector := NewSelector(nil, nil, nil, nil, time.Hour, time.Second, time.Minute)
 	selector.UpdateSegmentedSelector(true, 100, 8)
@@ -249,6 +271,22 @@ func TestSegmentedActiveScansEveryCandidateBeforeSaturated(t *testing.T) {
 	}
 	if sizes := limiter.BatchSizes(); fmt.Sprint(sizes) != "[8 8 8 8 68]" {
 		t.Fatalf("concurrency batch sizes = %v, want bounded windows followed by one full fallback", sizes)
+	}
+}
+
+func TestSegmentedActiveReportsNoAccountsWhenEveryCredentialIsStale(t *testing.T) {
+	selector := newSegmentedActiveTestSelector(8, newSegmentedSelectiveLimiter(), nil)
+	selector.UpdateSegmentedSelector(true, 8, 4)
+	repo := selector.accounts.(*layeredAccountRepository)
+	repo.materialErrors = make(map[uint64]error, 8)
+	for accountID := uint64(1); accountID <= 8; accountID++ {
+		repo.materialErrors[accountID] = repository.ErrNotFound
+	}
+
+	_, err := selector.Acquire(context.Background(), account.ProviderBuild, 0, "model", "", "", nil, false)
+	var unavailable *SelectionUnavailableError
+	if !errors.As(err, &unavailable) || unavailable.Reason != SelectionNoAccounts {
+		t.Fatalf("error = %v, want no accounts", err)
 	}
 }
 

@@ -1,5 +1,5 @@
 import { RotateCcw, Sparkles } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useRef, useState } from "react";
 import { Controller } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 
@@ -16,7 +16,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { EgressNodes } from "@/features/settings/egress-nodes";
 import { VersionUpdateSection } from "@/features/system/version-update";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { isByteSizeUnit, isDurationUnit, type ByteSizeValue, type DurationValue } from "@/features/settings/settings-model";
+import { isByteSizeUnit, isDurationUnit, MAX_ROUTING_ATTEMPTS, type ByteSizeValue, type DurationValue, UNLIMITED_ROUTING_ATTEMPTS } from "@/features/settings/settings-model";
 import { useSettings } from "@/features/settings/use-settings";
 import { ErrorState } from "@/shared/components/data-state";
 import { cn } from "@/shared/lib/cn";
@@ -25,6 +25,8 @@ export function SettingsPage() {
   const { t } = useTranslation();
   const { form, settingsQuery, updateMutation, reset } = useSettings();
   const [autoCleanConfirm, setAutoCleanConfirm] = useState<"enabled" | "includeDisabled" | null>(null);
+  const [unlimitedAttemptsConfirm, setUnlimitedAttemptsConfirm] = useState(false);
+  const limitedRoutingAttemptsRef = useRef(3);
   const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
   const buildForbiddenReauthEnabled = form.watch("accounts.markBuildForbiddenReauth") === true;
   const segmentedSelectorEnabled = form.watch("routing.segmentedSelector.enabled") === true;
@@ -53,7 +55,7 @@ export function SettingsPage() {
 
   return (
     <form className="w-full space-y-5" onSubmit={form.handleSubmit((values) => updateMutation.mutate(values))}>
-      <header className="relative sticky top-8 z-40 -mx-2 flex min-h-12 items-center justify-between gap-3 bg-background px-2 py-2 before:pointer-events-none before:absolute before:inset-x-0 before:-top-[100vh] before:h-[100vh] before:bg-background before:content-[''] lg:top-20">
+      <header className="relative sticky top-12 z-30 -mx-2 flex min-h-12 items-center justify-between gap-3 bg-background px-2 py-2 lg:top-20 lg:z-40 lg:before:pointer-events-none lg:before:absolute lg:before:inset-x-0 lg:before:-top-[100vh] lg:before:h-[100vh] lg:before:bg-background lg:before:content-['']">
         <div className="min-w-0">
           <h1 className="text-xl font-medium">{t("settings.title")}</h1>
           <p className="sr-only">{t("settings.description")}</p>
@@ -75,15 +77,15 @@ export function SettingsPage() {
 
       {loading ? <div className="flex min-h-64 items-center justify-center"><Spinner /></div> : null}
       {snapshot ? (
-        <Tabs defaultValue="build" className="flex flex-col gap-7 lg:flex-row lg:items-start">
-          <TabsList className="flex h-auto w-full shrink-0 justify-start gap-1 overflow-visible rounded-none bg-transparent p-0 [&>span]:rounded-md [&>span]:bg-muted/70 [&>span]:shadow-none lg:sticky lg:top-[148px] lg:w-56 lg:flex-col lg:items-stretch">
-            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="build">{t("models.providerGrokBuild")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="web">{t("settings.web.title")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="console">{t("console.name")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="delivery">{t("settings.groups.delivery")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="policies">{t("settings.groups.policies")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="accounts">{t("settings.accounts.title")}</TabsTrigger>
-            <TabsTrigger className="h-9 w-full shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium" value="about">{t("updates.title")}</TabsTrigger>
+        <Tabs defaultValue="build" className="flex min-w-0 flex-col gap-7 lg:flex-row lg:items-start">
+          <TabsList className="flex h-auto w-full max-w-full shrink-0 justify-start gap-1 overflow-x-auto overscroll-x-contain rounded-none bg-transparent p-0 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden [&>span]:rounded-md [&>span]:bg-muted/70 [&>span]:shadow-none lg:sticky lg:top-[148px] lg:w-56 lg:flex-col lg:items-stretch lg:overflow-visible">
+            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="build">{t("models.providerGrokBuild")}</TabsTrigger>
+            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="web">{t("settings.web.title")}</TabsTrigger>
+            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="console">{t("console.name")}</TabsTrigger>
+            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="delivery">{t("settings.groups.delivery")}</TabsTrigger>
+            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="policies">{t("settings.groups.policies")}</TabsTrigger>
+            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="accounts">{t("settings.accounts.title")}</TabsTrigger>
+            <TabsTrigger className="h-9 w-auto shrink-0 justify-start rounded-md px-3 text-xs data-[state=active]:font-medium lg:w-full" value="about">{t("updates.title")}</TabsTrigger>
           </TabsList>
 
           <div className="min-w-0 flex-1">
@@ -109,6 +111,7 @@ export function SettingsPage() {
               <SettingsField controlId="provider-token-auth" label={t("settings.provider.tokenAuth")} description={t("settings.provider.tokenAuthHelp")} error={form.formState.errors.providerBuild?.tokenAuth?.message}><Input id="provider-token-auth" autoComplete="off" {...form.register("providerBuild.tokenAuth")} /></SettingsField>
               <SettingsField controlId="provider-user-agent" label={t("settings.provider.userAgent")} description={t("settings.provider.userAgentHelp")} error={form.formState.errors.providerBuild?.userAgent?.message}><Input id="provider-user-agent" {...form.register("providerBuild.userAgent")} /></SettingsField>
               <SettingsField controlId="provider-response-header-timeout" label={t("settingsBuildTransport.responseHeaderTimeout")} description={t("settingsBuildTransport.responseHeaderTimeoutHelp")} error={form.formState.errors.providerBuild?.responseHeaderTimeout?.message}><Controller control={form.control} name="providerBuild.responseHeaderTimeout" render={({ field }) => <DurationInput id="provider-response-header-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
+              <SettingsField controlId="provider-stream-idle-timeout" label={t("settingsBuildTransport.streamIdleTimeout")} description={t("settingsBuildTransport.streamIdleTimeoutHelp")} error={form.formState.errors.providerBuild?.streamIdleTimeout?.message}><Controller control={form.control} name="providerBuild.streamIdleTimeout" render={({ field }) => <DurationInput id="provider-stream-idle-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
             </div>
           </SettingsSection>
           </SettingsPane>
@@ -138,6 +141,7 @@ export function SettingsPage() {
               )}
               <SettingsField controlId="web-quota-timeout" label={t("settings.web.quotaTimeout")} description={t("settings.web.quotaTimeoutHelp")} error={form.formState.errors.providerWeb?.quotaTimeout?.message}><Controller control={form.control} name="providerWeb.quotaTimeout" render={({ field }) => <DurationInput id="web-quota-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-chat-timeout" label={t("settings.web.chatTimeout")} description={t("settings.web.chatTimeoutHelp")} error={form.formState.errors.providerWeb?.chatTimeout?.message}><Controller control={form.control} name="providerWeb.chatTimeout" render={({ field }) => <DurationInput id="web-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
+              <SettingsField controlId="web-stream-idle-timeout" label={t("settings.web.streamIdleTimeout")} description={t("settings.web.streamIdleTimeoutHelp")} error={form.formState.errors.providerWeb?.streamIdleTimeout?.message}><Controller control={form.control} name="providerWeb.streamIdleTimeout" render={({ field }) => <DurationInput id="web-stream-idle-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-image-timeout" label={t("settings.web.imageTimeout")} description={t("settings.web.imageTimeoutHelp")} error={form.formState.errors.providerWeb?.imageTimeout?.message}><Controller control={form.control} name="providerWeb.imageTimeout" render={({ field }) => <DurationInput id="web-image-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-video-timeout" label={t("settings.web.videoTimeout")} description={t("settings.web.videoTimeoutHelp")} error={form.formState.errors.providerWeb?.videoTimeout?.message}><Controller control={form.control} name="providerWeb.videoTimeout" render={({ field }) => <DurationInput id="web-video-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-media-concurrency" label={t("settings.web.mediaConcurrency")} description={t("settings.web.mediaConcurrencyHelp")} badge={t("settings.restartRequired")} error={form.formState.errors.providerWeb?.mediaConcurrency?.message}><Input id="web-media-concurrency" type="number" min={1} max={64} {...form.register("providerWeb.mediaConcurrency", { valueAsNumber: true })} /></SettingsField>
@@ -153,6 +157,7 @@ export function SettingsPage() {
             <div className="space-y-0">
               <SettingsField controlId="console-base-url" className="sm:col-span-2" label={t("console.baseURL")} description={t("settings.console.baseURLHelp")} error={form.formState.errors.providerConsole?.baseURL?.message}><Input id="console-base-url" type="url" {...form.register("providerConsole.baseURL")} /></SettingsField>
               <SettingsField controlId="console-chat-timeout" label={t("console.chatTimeout")} description={t("settings.console.chatTimeoutHelp")} error={form.formState.errors.providerConsole?.chatTimeout?.message}><Controller control={form.control} name="providerConsole.chatTimeout" render={({ field }) => <DurationInput id="console-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
+              <SettingsField controlId="console-stream-idle-timeout" label={t("settings.console.streamIdleTimeout")} description={t("settings.console.streamIdleTimeoutHelp")} error={form.formState.errors.providerConsole?.streamIdleTimeout?.message}><Controller control={form.control} name="providerConsole.streamIdleTimeout" render={({ field }) => <DurationInput id="console-stream-idle-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
             </div>
           </SettingsSection>
           </SettingsPane>
@@ -229,12 +234,71 @@ export function SettingsPage() {
               <SettingsField controlId="routing-cooldown-base" label={t("settings.routing.cooldownBase")} description={t("settings.routing.cooldownBaseHelp")} error={form.formState.errors.routing?.cooldownBase?.message}><Controller control={form.control} name="routing.cooldownBase" render={({ field }) => <DurationInput id="routing-cooldown-base" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="routing-cooldown-max" label={t("settings.routing.cooldownMax")} description={t("settings.routing.cooldownMaxHelp")} error={form.formState.errors.routing?.cooldownMax?.message}><Controller control={form.control} name="routing.cooldownMax" render={({ field }) => <DurationInput id="routing-cooldown-max" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="routing-capacity-wait" label={t("settings.routing.capacityWait", { defaultValue: "Saturated account wait" })} description={t("settings.routing.capacityWaitHelp")} error={form.formState.errors.routing?.capacityWait?.message}><Controller control={form.control} name="routing.capacityWait" render={({ field }) => <DurationInput id="routing-capacity-wait" value={field.value} onChange={field.onChange} />} /></SettingsField>
-              <SettingsField controlId="routing-max-attempts" label={t("settings.routing.maxAttempts")} description={t("settings.routing.maxAttemptsHelp")} error={form.formState.errors.routing?.maxAttempts?.message}><Input id="routing-max-attempts" type="number" min={1} max={10} {...form.register("routing.maxAttempts", { valueAsNumber: true })} /></SettingsField>
+              <SettingsField controlId="routing-max-attempts" label={t("settings.routing.maxAttempts")} description={t("settingsRoutingAttempts.help")} error={form.formState.errors.routing?.maxAttempts?.message}>
+                <Controller control={form.control} name="routing.maxAttempts" render={({ field }) => {
+                  const unlimited = field.value === UNLIMITED_ROUTING_ATTEMPTS;
+                  return (
+                    <div className="flex h-9 items-center gap-3">
+                      <Input
+                        id="routing-max-attempts"
+                        ref={field.ref}
+                        name={field.name}
+                        type="number"
+                        min={1}
+                        max={MAX_ROUTING_ATTEMPTS}
+                        disabled={unlimited}
+                        value={unlimited || !Number.isFinite(field.value) ? "" : field.value}
+                        placeholder={t("settingsRoutingAttempts.unlimited")}
+                        onBlur={field.onBlur}
+                        onChange={(event) => field.onChange(event.currentTarget.valueAsNumber)}
+                      />
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span className="text-xs text-muted-foreground">{t("settingsRoutingAttempts.unlimited")}</span>
+                        <Switch
+                          id="routing-max-attempts-unlimited"
+                          aria-label={t("settingsRoutingAttempts.unlimited")}
+                          checked={unlimited}
+                          onCheckedChange={(checked) => {
+                            if (checked) {
+                              if (field.value > 0) limitedRoutingAttemptsRef.current = field.value;
+                              setUnlimitedAttemptsConfirm(true);
+                              return;
+                            }
+                            field.onChange(limitedRoutingAttemptsRef.current);
+                          }}
+                        />
+                      </div>
+                    </div>
+                  );
+                }} />
+              </SettingsField>
               <SettingsField controlId="routing-prefer-free-build" label={t("settings.routing.preferFreeBuild")} description={t("settings.routing.preferFreeBuildHelp")}><Controller control={form.control} name="routing.preferFreeBuild" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-prefer-free-build" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
+              <SettingsField controlId="routing-mark-build-chat-denied-as-reauth" label={t("settings.routing.markBuildChatDeniedAsReauth")} description={t("settings.routing.markBuildChatDeniedAsReauthHelp")}><Controller control={form.control} name="routing.markBuildChatDeniedAsReauth" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-mark-build-chat-denied-as-reauth" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
+              <SettingsField controlId="routing-account-isolated-connections" label={t("settings.routing.accountIsolatedConnections")} description={t("settings.routing.accountIsolatedConnectionsHelp")}><Controller control={form.control} name="routing.accountIsolatedConnections" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-account-isolated-connections" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
               <SettingsField controlId="routing-segmented-selector-enabled" label={t("settingsRoutingSegmented.enabled")} description={t("settingsRoutingSegmented.enabledHelp")}><Controller control={form.control} name="routing.segmentedSelector.enabled" render={({ field }) => <div className="flex h-9 items-center"><Switch id="routing-segmented-selector-enabled" checked={field.value} onCheckedChange={field.onChange} /></div>} /></SettingsField>
               <SettingsField controlId="routing-segmented-min-candidates" label={t("settingsRoutingSegmented.minCandidates")} description={t("settingsRoutingSegmented.minCandidatesHelp")} error={form.formState.errors.routing?.segmentedSelector?.minCandidates?.message}><Input id="routing-segmented-min-candidates" type="number" min={100} max={1_000_000} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.minCandidates", { valueAsNumber: true })} /></SettingsField>
               <SettingsField controlId="routing-segmented-window-size" label={t("settingsRoutingSegmented.windowSize")} description={t("settingsRoutingSegmented.windowSizeHelp")} error={form.formState.errors.routing?.segmentedSelector?.windowSize?.message}><Input id="routing-segmented-window-size" type="number" min={8} max={256} disabled={!segmentedSelectorEnabled} {...form.register("routing.segmentedSelector.windowSize", { valueAsNumber: true })} /></SettingsField>
             </div>
+            <AlertDialog open={unlimitedAttemptsConfirm} onOpenChange={setUnlimitedAttemptsConfirm}>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>{t("settingsRoutingAttempts.unlimitedTitle")}</AlertDialogTitle>
+                  <AlertDialogDescription>{t("settingsRoutingAttempts.unlimitedDescription")}</AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+                  <AlertDialogAction
+                    className="bg-destructive text-white hover:bg-destructive/90"
+                    onClick={() => {
+                      form.setValue("routing.maxAttempts", UNLIMITED_ROUTING_ATTEMPTS, { shouldDirty: true, shouldTouch: true, shouldValidate: true });
+                      setUnlimitedAttemptsConfirm(false);
+                    }}
+                  >
+                    {t("settingsRoutingAttempts.unlimitedConfirm")}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </SettingsSection>
 
           <SettingsSection title={t("settings.audit.title")}>
@@ -277,6 +341,30 @@ export function SettingsPage() {
                     disabled={!buildForbiddenReauthEnabled}
                     placeholder={t("settingsBuildForbidden.codesPlaceholder")}
                     {...form.register("accounts.buildForbiddenReauthCodes")}
+                  />
+                </SettingsField>
+              </div>
+            </SettingsSection>
+
+            <SettingsSection title={t("settings.accounts.botRiskSchedulingTitle")}>
+              <div className="space-y-0">
+                <SettingsField
+                  controlId="accounts-exclude-build-bot-flagged"
+                  label={t("settings.accounts.excludeBuildBotFlaggedFromScheduling")}
+                  description={t("settings.accounts.excludeBuildBotFlaggedFromSchedulingHelp")}
+                >
+                  <Controller
+                    control={form.control}
+                    name="accounts.excludeBuildBotFlaggedFromScheduling"
+                    render={({ field }) => (
+                      <div className="flex h-9 items-center">
+                        <Switch
+                          id="accounts-exclude-build-bot-flagged"
+                          checked={Boolean(field.value)}
+                          onCheckedChange={field.onChange}
+                        />
+                      </div>
+                    )}
                   />
                 </SettingsField>
               </div>

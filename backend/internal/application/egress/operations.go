@@ -27,6 +27,7 @@ var ErrOperationsUnavailable = errors.New("代理运营功能不可用")
 // provides this richer administrative surface.
 type OperationsRepository interface {
 	ListEgressSources(context.Context) ([]domain.SubscriptionSource, error)
+	ListEgressSourcePage(context.Context, repository.EgressSourceListQuery) ([]domain.SubscriptionSource, int64, error)
 	ListDueEgressSources(context.Context, time.Time, int) ([]domain.SubscriptionSource, error)
 	GetEgressSource(context.Context, uint64) (domain.SubscriptionSource, error)
 	CreateEgressSource(context.Context, domain.SubscriptionSource) (domain.SubscriptionSource, error)
@@ -35,7 +36,7 @@ type OperationsRepository interface {
 	UpdateEgressSourceSync(context.Context, uint64, time.Time, time.Time, int, string) error
 	UpsertEgressNodesFromSource(context.Context, uint64, []domain.Node) (int, error)
 	CreateEgressNodes(context.Context, []domain.Node) (int, error)
-	UpdateEgressNodeProbe(context.Context, uint64, domain.ProbeResult) error
+	UpdateEgressNodeProbe(context.Context, uint64, string, domain.ProbeResult) error
 	ListDueEgressNodes(context.Context, time.Time, time.Duration, int) ([]domain.Node, error)
 	GetEgressOperationsConfig(context.Context) (domain.OperationsConfig, error)
 	SaveEgressOperationsConfig(context.Context, domain.OperationsConfig) (domain.OperationsConfig, error)
@@ -44,7 +45,7 @@ type OperationsRepository interface {
 // NodeProber is implemented by the infrastructure egress manager. Its fixed
 // probe endpoint prevents admin input from controlling the outbound target.
 type NodeProber interface {
-	ProbeEgressNode(context.Context, uint64) (domain.ProbeResult, error)
+	ProbeEgressNode(context.Context, domain.Node) (domain.ProbeResult, error)
 }
 
 type OperationsConfigInvalidator interface {
@@ -59,6 +60,10 @@ type SubscriptionSourceInput struct {
 	ClearURL               bool
 	RefreshIntervalSeconds *int
 	DefaultAccountCapacity *int
+}
+
+type SourceListFilter struct {
+	Scope domain.Scope
 }
 
 type ImportInput struct {
@@ -80,11 +85,17 @@ type ProbeBatchResult struct {
 }
 
 type OperationsConfigInput struct {
+	ProbeProvider             domain.ProbeProvider
 	ProbeIntervalSeconds      int
 	AutoAssignEnabled         bool
 	AutoBalanceEnabled        bool
 	AssignmentIntervalSeconds int
-	Fallbacks                 map[domain.Scope]FallbackConfigInput
+	// SubscriptionProxyURL updates the optional proxy used when fetching remote
+	// subscription sources and must be non-empty when supplied. The explicit
+	// ClearSubscriptionProxy flag clears it; nil leaves the secret unchanged.
+	SubscriptionProxyURL   *string
+	ClearSubscriptionProxy bool
+	Fallbacks              map[domain.Scope]FallbackConfigInput
 }
 
 type FallbackConfigInput struct {
@@ -140,6 +151,29 @@ func (s *Service) ListSources(ctx context.Context) ([]domain.PublicSubscriptionS
 		result = append(result, publicSource(value))
 	}
 	return result, nil
+}
+
+func (s *Service) ListSourcePage(ctx context.Context, page, pageSize int, search string, filter SourceListFilter) ([]domain.PublicSubscriptionSource, int64, error) {
+	page, pageSize = repository.NormalizePage(page, pageSize, repository.DefaultPageSize)
+	if !validListScope(filter.Scope) {
+		return nil, 0, ErrInvalidFilter
+	}
+	operations, err := s.operationsRepository()
+	if err != nil {
+		return nil, 0, err
+	}
+	values, total, err := operations.ListEgressSourcePage(ctx, repository.EgressSourceListQuery{
+		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: strings.TrimSpace(search)},
+		Filter: repository.EgressSourceListFilter{Scope: filter.Scope},
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	result := make([]domain.PublicSubscriptionSource, 0, len(values))
+	for _, value := range values {
+		result = append(result, publicSource(value))
+	}
+	return result, total, nil
 }
 
 func (s *Service) CreateSource(ctx context.Context, input SubscriptionSourceInput) (domain.PublicSubscriptionSource, error) {
@@ -253,7 +287,8 @@ func (s *Service) TestNode(ctx context.Context, id uint64) (domain.ProbeResult, 
 	if err != nil {
 		return domain.ProbeResult{}, err
 	}
-	if _, err := s.repository.GetEgressNode(ctx, id); errors.Is(err, repository.ErrNotFound) {
+	node, err := s.repository.GetEgressNode(ctx, id)
+	if errors.Is(err, repository.ErrNotFound) {
 		return domain.ProbeResult{}, ErrNotFound
 	} else if err != nil {
 		return domain.ProbeResult{}, err
@@ -262,7 +297,7 @@ func (s *Service) TestNode(ctx context.Context, id uint64) (domain.ProbeResult, 
 	if prober == nil {
 		return domain.ProbeResult{}, ErrOperationsUnavailable
 	}
-	result, probeErr := prober.ProbeEgressNode(ctx, id)
+	result, probeErr := prober.ProbeEgressNode(ctx, node)
 	if result.TestedAt.IsZero() {
 		result.TestedAt = time.Now().UTC()
 	}
@@ -275,9 +310,12 @@ func (s *Service) TestNode(ctx context.Context, id uint64) (domain.ProbeResult, 
 			result.Error = "代理探测失败"
 		}
 	}
-	if updateErr := operations.UpdateEgressNodeProbe(ctx, id, result); updateErr != nil {
+	if updateErr := operations.UpdateEgressNodeProbe(ctx, id, node.EncryptedProxyURL, result); updateErr != nil {
 		if errors.Is(updateErr, repository.ErrNotFound) {
 			return result, ErrNotFound
+		}
+		if errors.Is(updateErr, repository.ErrConflict) {
+			return result, ErrProbeStale
 		}
 		return result, updateErr
 	}
@@ -361,6 +399,13 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 	if err != nil {
 		return domain.OperationsConfig{}, err
 	}
+	probeProvider := input.ProbeProvider
+	if probeProvider == "" {
+		probeProvider = current.ProbeProvider.Normalized()
+	}
+	if !probeProvider.IsValid() {
+		return domain.OperationsConfig{}, fmt.Errorf("%w: 不支持的代理探测服务", ErrInvalidInput)
+	}
 	fallbacks := current.Fallbacks
 	if input.Fallbacks != nil {
 		fallbacks, err = s.validateFallbacks(ctx, current, input.Fallbacks)
@@ -368,11 +413,35 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 			return domain.OperationsConfig{}, err
 		}
 	}
+	subscriptionProxyURL := current.EncryptedSubscriptionProxyURL
+	if input.ClearSubscriptionProxy {
+		subscriptionProxyURL = ""
+	} else if input.SubscriptionProxyURL != nil {
+		normalized, normalizeErr := NormalizeProxyURL(*input.SubscriptionProxyURL)
+		if normalizeErr != nil {
+			return domain.OperationsConfig{}, fmt.Errorf("%w: 订阅拉取代理地址无效: %v", ErrInvalidInput, normalizeErr)
+		}
+		if normalized == "" {
+			return domain.OperationsConfig{}, fmt.Errorf("%w: 订阅拉取代理地址不能为空；如需清除请显式指定 clearSubscriptionProxy", ErrInvalidInput)
+		}
+		if strings.Contains(normalized, ProxyAccountPlaceholder) {
+			return domain.OperationsConfig{}, fmt.Errorf("%w: 订阅拉取代理不能使用账号占位符", ErrInvalidInput)
+		}
+		encrypted, encryptErr := s.cipher.Encrypt(normalized)
+		if encryptErr != nil {
+			return domain.OperationsConfig{}, encryptErr
+		}
+		subscriptionProxyURL = encrypted
+	}
 	saved, err := operations.SaveEgressOperationsConfig(ctx, domain.OperationsConfig{
-		ProbeIntervalSeconds: input.ProbeIntervalSeconds, AutoAssignEnabled: input.AutoAssignEnabled,
+		ProbeProvider: probeProvider, ProbeIntervalSeconds: input.ProbeIntervalSeconds, AutoAssignEnabled: input.AutoAssignEnabled,
 		AutoBalanceEnabled: input.AutoBalanceEnabled, AssignmentIntervalSeconds: input.AssignmentIntervalSeconds,
-		Fallbacks: fallbacks, UpdatedAt: time.Now().UTC(),
+		EncryptedSubscriptionProxyURL: subscriptionProxyURL,
+		Fallbacks:                     fallbacks, UpdatedAt: time.Now().UTC(),
 	})
+	if errors.Is(err, repository.ErrEgressFallbackInUse) {
+		return domain.OperationsConfig{}, fmt.Errorf("%w: 固定回退节点必须保持启用且可用", ErrInvalidInput)
+	}
 	if err == nil {
 		s.invalidateOperationsConfig()
 	}
@@ -380,8 +449,8 @@ func (s *Service) UpdateOperationsConfig(ctx context.Context, input OperationsCo
 }
 
 func (s *Service) validateFallbacks(ctx context.Context, current domain.OperationsConfig, input map[domain.Scope]FallbackConfigInput) (map[domain.Scope]domain.FallbackConfig, error) {
-	result := make(map[domain.Scope]domain.FallbackConfig, 4)
-	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+	result := make(map[domain.Scope]domain.FallbackConfig, len(allOperationScopes()))
+	for _, scope := range allOperationScopes() {
 		result[scope] = current.FallbackFor(scope)
 	}
 	for scope, fallback := range input {
@@ -501,7 +570,11 @@ func publicSource(value domain.SubscriptionSource) domain.PublicSubscriptionSour
 }
 
 func validScope(scope domain.Scope) bool {
-	return scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset
+	return scope == domain.ScopeBuild || scope == domain.ScopeWeb || scope == domain.ScopeConsole || scope == domain.ScopeWebAsset || scope == domain.ScopeConsoleAsset
+}
+
+func allOperationScopes() []domain.Scope {
+	return []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset, domain.ScopeConsoleAsset}
 }
 
 func validateImportInput(input ImportInput) error {

@@ -3,12 +3,15 @@ package egress
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"sort"
 	"strconv"
@@ -40,13 +43,23 @@ const clearanceCacheCleanupInterval = time.Minute
 const clearanceCacheMinIdleTTL = 30 * time.Minute
 const maxCachedClearances = 16384
 const clearanceCacheEvictionBatch = 256
-const egressProbeEndpoint = "https://api64.ipify.org?format=json"
+
+// clientClosedRequestStatus is the conventional proxy status for a client-aborted request.
+const clientClosedRequestStatus = 499
+const egressIPv4ProbeEndpoint = "https://ipinfo.io/json"
+const egressIPv6ProbeEndpoint = "https://v6.ipinfo.io/json"
+const cloudflareIPv4ProbeEndpoint = "https://1.1.1.1/cdn-cgi/trace"
+const cloudflareIPv6ProbeEndpoint = "https://[2606:4700:4700::1111]/cdn-cgi/trace"
 const egressProbeTimeout = 15 * time.Second
+const failureProbeCompletionGrace = 5 * time.Second
+const failureProbeTimeout = 20 * time.Second
+const failureProbeWaitTimeout = 5 * time.Second
 const clientCreationRetryLimit = 3
 const maxClientVersionEntries = 4096
 
 var errNodeSnapshotInvalidated = errors.New("egress node snapshot invalidated")
 var errClientCacheInvalidated = errors.New("egress client cache invalidated")
+var errAccountConnectionIsolationDisabled = errors.New("egress account connection isolation disabled")
 
 type Lease struct {
 	NodeID           uint64
@@ -59,6 +72,7 @@ type Lease struct {
 	browser          *browserClient
 	sticky           bool
 	proxyPool        bool
+	freshTunnel      bool
 	clearanceKey     string
 	clearanceManager *Manager
 	release          func()
@@ -67,6 +81,14 @@ type Lease struct {
 type requestClient interface {
 	Do(*http.Request) (*http.Response, error)
 	CloseIdleConnections()
+}
+
+type FailureProber func(context.Context, uint64) (domain.ProbeResult, error)
+
+type failureProbeState struct {
+	running       bool
+	lastCompleted time.Time
+	done          chan struct{}
 }
 
 func (l *Lease) Do(request *http.Request) (*http.Response, error) {
@@ -82,6 +104,14 @@ func (l *Lease) DoDeferredForbidden(request *http.Request) (*http.Response, erro
 func (l *Lease) doRequest(request *http.Request, invalidateForbidden bool) (*http.Response, error) {
 	if l == nil || l.client == nil {
 		return nil, errors.New("出口客户端未初始化")
+	}
+	// Rotating proxy endpoints choose an exit when a new CONNECT tunnel is
+	// established. Reusing a Build keep-alive/HTTP2 connection would pin many
+	// otherwise independent requests to one exit and defeat proxy-pool
+	// rotation. Proxy-pool mode is explicit, so trade the extra handshake for a
+	// fresh tunnel without changing fixed-proxy, direct, Web, or Console paths.
+	if l.Scope == domain.ScopeBuild && l.freshTunnel {
+		request.Close = true
 	}
 	response, err := l.do(request)
 	recordPhysicalCall(request.Context(), response, err)
@@ -107,35 +137,42 @@ func (l *Lease) Release() {
 }
 
 type Manager struct {
-	repository           repository.EgressRepository
-	cipher               *security.Cipher
-	nodeMu               sync.RWMutex
-	clientMu             sync.RWMutex
-	clearanceMu          sync.Mutex
-	operationsMu         sync.RWMutex
-	clients              map[clientCacheKey]cachedClient
-	inflight             sync.Map
-	nodes                map[domain.Scope]cachedNodeSnapshot
-	healthyNodes         map[uint64]time.Time
-	nodeVersions         map[domain.Scope]uint64
-	nodeLoads            singleflight.Group
-	clientLoads          singleflight.Group
-	clientVersions       map[uint64]uint64
-	clientGeneration     uint64
-	buildHeaderTimeout   atomic.Int64
-	operationsConfig     cachedOperationsConfig
-	operationsConfigLoad singleflight.Group
-	operationsConfigVer  uint64
-	lastClientCleanup    time.Time
-	clearanceLoads       singleflight.Group
-	clearanceConfig      ClearanceConfig
-	clearanceVersion     uint64
-	clearances           map[string]clearanceState
-	lastClearanceCleanup time.Time
-	solver               clearanceSolver
-	clearanceLock        repository.DistributedLock
-	newBuildClient       func(string, time.Duration) (requestClient, error)
-	newBrowserClient     func(string, string) (*browserClient, error)
+	repository             repository.EgressRepository
+	cipher                 *security.Cipher
+	logger                 *slog.Logger
+	nodeMu                 sync.RWMutex
+	clientMu               sync.RWMutex
+	clearanceMu            sync.Mutex
+	operationsMu           sync.RWMutex
+	clients                map[clientCacheKey]cachedClient
+	inflight               sync.Map
+	nodes                  map[domain.Scope]cachedNodeSnapshot
+	healthyNodes           map[uint64]time.Time
+	nodeVersions           map[domain.Scope]uint64
+	nodeLoads              singleflight.Group
+	clientLoads            singleflight.Group
+	clientVersions         map[uint64]uint64
+	clientGeneration       uint64
+	buildHeaderTimeout     atomic.Int64
+	buildStreamIdleTimeout atomic.Int64
+	accountIsolated        atomic.Bool
+	operationsConfig       cachedOperationsConfig
+	operationsConfigLoad   singleflight.Group
+	operationsConfigVer    uint64
+	failureProbeMu         sync.Mutex
+	failureProber          FailureProber
+	failureProbes          map[uint64]failureProbeState
+	lastClientCleanup      time.Time
+	clearanceLoads         singleflight.Group
+	clearanceConfig        ClearanceConfig
+	clearanceVersion       uint64
+	clearances             map[string]clearanceState
+	lastClearanceCleanup   time.Time
+	solver                 clearanceSolver
+	clearanceLock          repository.DistributedLock
+	newBuildClient         func(string, time.Duration) (requestClient, error)
+	newBuildEnvClient      func(time.Duration) (requestClient, error)
+	newBrowserClient       func(string, string) (*browserClient, error)
 }
 
 type clearanceState struct {
@@ -170,9 +207,10 @@ type cachedClient struct {
 }
 
 type clientCacheKey struct {
-	nodeID      uint64
-	scope       domain.Scope
-	fingerprint string
+	nodeID          uint64
+	scope           domain.Scope
+	fingerprint     string
+	accountIdentity string
 }
 
 type cachedNodeSnapshot struct {
@@ -191,12 +229,107 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		clients: make(map[clientCacheKey]cachedClient),
 		nodes:   make(map[domain.Scope]cachedNodeSnapshot), healthyNodes: make(map[uint64]time.Time),
 		nodeVersions: make(map[domain.Scope]uint64), clientVersions: make(map[uint64]uint64), clearances: make(map[string]clearanceState),
-		newBuildClient: newBuildRequestClient, newBrowserClient: newBrowserClient,
+		failureProbes:  make(map[uint64]failureProbeState),
+		newBuildClient: newBuildRequestClient, newBuildEnvClient: newBuildEnvironmentRequestClient, newBrowserClient: newBrowserClient,
 		solver:          flaresolverrSolver{},
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
 	}
 	manager.buildHeaderTimeout.Store(int64(settingsdomain.DefaultBuildResponseHeaderTimeout))
+	manager.buildStreamIdleTimeout.Store(int64(settingsdomain.DefaultBuildStreamIdleTimeout))
 	return manager
+}
+
+func (m *Manager) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	m.logger = logger
+}
+
+func (m *Manager) log() *slog.Logger {
+	if m == nil || m.logger == nil {
+		return slog.Default()
+	}
+	return m.logger
+}
+
+// SetFailureProber enables an immediate, deduplicated connectivity probe after
+// a fixed proxy reports a transport failure. The callback persists the probe
+// result; it must not depend on the failed request context.
+func (m *Manager) SetFailureProber(value FailureProber) {
+	m.failureProbeMu.Lock()
+	m.failureProber = value
+	if value == nil {
+		clear(m.failureProbes)
+	}
+	m.failureProbeMu.Unlock()
+}
+
+func (m *Manager) scheduleFailureProbe(node domain.Node) {
+	m.failureProbeMu.Lock()
+	prober := m.failureProber
+	state := m.failureProbes[node.ID]
+	if prober == nil || state.running {
+		m.failureProbeMu.Unlock()
+		return
+	}
+	state.running = true
+	state.done = make(chan struct{})
+	m.failureProbes[node.ID] = state
+	done := state.done
+	m.failureProbeMu.Unlock()
+
+	m.log().Info("egress_failure_probe_scheduled", "node_id", node.ID, "node_name", node.Name, "scope", node.Scope)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), failureProbeTimeout)
+		result, err := prober(ctx, node.ID)
+		cancel()
+
+		m.failureProbeMu.Lock()
+		state := m.failureProbes[node.ID]
+		if state.done == done {
+			state.running = false
+			state.lastCompleted = time.Now().UTC()
+			m.failureProbes[node.ID] = state
+		}
+		close(done)
+		m.failureProbeMu.Unlock()
+
+		if err != nil {
+			m.log().Warn("egress_failure_probe_failed", "node_id", node.ID, "node_name", node.Name, "scope", node.Scope, "error", err)
+			return
+		}
+		if result.Status == domain.ProbeStatusHealthy {
+			m.invalidateNodes(node.Scope)
+		}
+		m.log().Info("egress_failure_probe_completed", "node_id", node.ID, "node_name", node.Name, "scope", node.Scope, "probe_status", result.Status, "latency_ms", result.LatencyMS)
+	}()
+}
+
+func (m *Manager) waitForFailureProbe(ctx context.Context, nodeID uint64) (bool, error) {
+	now := time.Now().UTC()
+	m.failureProbeMu.Lock()
+	state, exists := m.failureProbes[nodeID]
+	m.failureProbeMu.Unlock()
+	if !exists {
+		return false, nil
+	}
+	if !state.running {
+		return !state.lastCompleted.IsZero() && now.Sub(state.lastCompleted) < failureProbeCompletionGrace, nil
+	}
+	if state.done == nil {
+		return false, nil
+	}
+	timer := time.NewTimer(failureProbeWaitTimeout)
+	defer timer.Stop()
+	select {
+	case <-state.done:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+		return false, nil
+	}
 }
 
 // UpdateBuildResponseHeaderTimeout rebuilds only cached Build clients. Active
@@ -217,6 +350,63 @@ func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
 	}
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
+}
+
+// UpdateBuildStreamIdleTimeout affects subsequent Build streams. Active
+// response bodies retain the deadline captured by their existing wrapper and
+// are not interrupted; the underlying HTTP connection pool is unchanged.
+func (m *Manager) UpdateBuildStreamIdleTimeout(value time.Duration) {
+	if value <= 0 {
+		value = settingsdomain.DefaultBuildStreamIdleTimeout
+	}
+	m.buildStreamIdleTimeout.Store(int64(value))
+}
+
+// BuildStreamIdleTimeout returns the configured stream idle deadline for Grok
+// Build responses. Returns zero when idle enforcement is disabled.
+func (m *Manager) BuildStreamIdleTimeout() time.Duration {
+	return time.Duration(m.buildStreamIdleTimeout.Load())
+}
+
+// UpdateAccountIsolatedConnections toggles per-account upstream connection pools.
+// When enabled, different accounts do not share TCP/HTTP clients so upstream
+// egress load balancers can spread traffic by connection; the same account still
+// reuses its own pool. Changing the setting rebuilds cached clients without
+// interrupting in-flight requests.
+func (m *Manager) UpdateAccountIsolatedConnections(enabled bool) {
+	m.clientMu.Lock()
+	if m.accountIsolated.Load() == enabled {
+		m.clientMu.Unlock()
+		return
+	}
+	// Change the mode while holding the same lock used to validate client-cache
+	// keys. This makes the mode snapshot and cache invalidation one transition.
+	m.accountIsolated.Store(enabled)
+	stale := make([]requestClient, 0, len(m.clients))
+	for key, cached := range m.clients {
+		stale = append(stale, m.evictClientLocked(key, cached))
+	}
+	m.invalidateAllClientVersionsLocked()
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+	m.log().Info("egress_account_connection_isolation_updated", "enabled", enabled, "evicted_clients", len(stale))
+}
+
+// AccountIsolatedConnections reports whether upstream clients are partitioned by account.
+func (m *Manager) AccountIsolatedConnections() bool {
+	return m != nil && m.accountIsolated.Load()
+}
+
+func isolationAccountIdentity(ctx context.Context, scope domain.Scope, affinity string) string {
+	identity := accountFromContext(ctx)
+	if identity != "" {
+		return identity
+	}
+	affinity = strings.TrimSpace(affinity)
+	if affinity != "" {
+		return string(scope) + "_" + affinity
+	}
+	return "shared"
 }
 
 // SetClearanceLock enables cross-instance coordination for shared, fixed egress
@@ -250,6 +440,22 @@ func (m *Manager) Acquire(ctx context.Context, scope domain.Scope, affinity stri
 	return lease, err
 }
 
+// AcquireBuildEnvironmentDirectIfIsolated creates an account-partitioned direct
+// Build lease while preserving the legacy direct transport's environment-proxy
+// semantics. The bool is false when isolation was disabled before the lease was
+// acquired, allowing the caller to retain its original fallback transport.
+func (m *Manager) AcquireBuildEnvironmentDirectIfIsolated(ctx context.Context, affinity string) (*Lease, bool, error) {
+	selected := domain.Node{ID: 0, Name: "direct", Scope: domain.ScopeBuild, Enabled: true, Health: 1}
+	lease, _, err := m.leaseForNodeWithOptions(ctx, domain.ScopeBuild, affinity, "", false, selected, clientOptions{
+		buildEnvironmentProxy:   true,
+		requireAccountIsolation: true,
+	})
+	if errors.Is(err, errAccountConnectionIsolationDisabled) {
+		return nil, false, nil
+	}
+	return lease, err == nil, err
+}
+
 // AcquireCredential binds the outbound proxy identity to one persisted
 // Provider credential. Resin templates use this identity as their Account.
 func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, credential accountdomain.Credential) (*Lease, error) {
@@ -279,47 +485,205 @@ func (m *Manager) AcquireIfConfigured(ctx context.Context, scope domain.Scope, a
 	return m.acquire(ctx, scope, affinity, false, "", egressNodeFromContext(ctx))
 }
 
-// ProbeEgressNode verifies one configured proxy using a fixed public IP echo
-// endpoint. The target is intentionally not caller-controlled, so management
-// APIs cannot turn proxy tests into an internal-network request primitive.
-func (m *Manager) ProbeEgressNode(ctx context.Context, nodeID uint64) (domain.ProbeResult, error) {
-	return m.probeEgressNode(ctx, nodeID, egressProbeEndpoint)
+type preparedEgressProbe struct {
+	nodeID    uint64
+	nodeName  string
+	nodeScope domain.Scope
+	proxyURL  string
 }
 
-func (m *Manager) probeEgressNode(ctx context.Context, nodeID uint64, targetURL string) (domain.ProbeResult, error) {
-	startedAt := time.Now().UTC()
-	result := domain.ProbeResult{Status: domain.ProbeStatusUnhealthy, TestedAt: startedAt}
-	if nodeID == 0 {
-		result.Error = "代理节点 ID 无效"
-		return result, errors.New(result.Error)
+// ProbeEgressNode verifies IPv4 and IPv6 independently through fixed provider
+// endpoints. Both requests share one immutable node snapshot so a concurrent
+// administrator edit cannot mix results from different proxy configurations.
+func (m *Manager) ProbeEgressNode(ctx context.Context, node domain.Node) (domain.ProbeResult, error) {
+	type outcome struct {
+		family string
+		result domain.ProbeFamilyResult
+		err    error
 	}
-	node, err := m.repository.GetEgressNode(ctx, nodeID)
-	if err != nil {
-		result.Error = "读取代理节点失败"
-		return result, err
+	startedAt := time.Now().UTC()
+	var provider domain.ProbeProvider
+	config, supported, configErr := m.loadOperationsConfig(ctx, time.Now().UTC())
+	if configErr != nil {
+		message := "读取代理探测服务配置失败"
+		result := failedEgressProbeResult(provider, message, startedAt)
+		m.logProbeSetupFailure(ctx, node, provider, "load_probe_config", message, configErr, result.LatencyMS)
+		return result, configErr
+	}
+	if supported {
+		provider = config.ProbeProvider.Normalized()
+	} else {
+		provider = domain.ProbeProviderCloudflare
+	}
+	target, stage, message, prepareErr := m.prepareEgressProbe(node)
+	if prepareErr != nil {
+		result := failedEgressProbeResult(provider, message, startedAt)
+		m.logProbeSetupFailure(ctx, node, provider, stage, message, prepareErr, result.LatencyMS)
+		return result, prepareErr
+	}
+	ipv4Endpoint, ipv6Endpoint := probeEndpoints(provider)
+	outcomes := make(chan outcome, 2)
+	for _, probe := range []struct{ family, endpoint string }{{"ipv4", ipv4Endpoint}, {"ipv6", ipv6Endpoint}} {
+		go func() {
+			result, err := m.probeEgressEndpoint(ctx, target, provider, probe.family, probe.endpoint)
+			outcomes <- outcome{family: probe.family, result: result, err: err}
+		}()
+	}
+	var ipv4Err, ipv6Err error
+	result := domain.ProbeResult{Status: domain.ProbeStatusUnhealthy, Provider: provider}
+	for range 2 {
+		current := <-outcomes
+		if current.family == "ipv4" {
+			result.IPv4, ipv4Err = current.result, current.err
+		} else {
+			result.IPv6, ipv6Err = current.result, current.err
+		}
+	}
+	result.TestedAt = time.Now().UTC()
+	result.LatencyMS = max(result.IPv4.LatencyMS, result.IPv6.LatencyMS)
+	if result.IPv4.Status == domain.ProbeStatusHealthy {
+		result.Status, result.ExitIP = domain.ProbeStatusHealthy, result.IPv4.ExitIP
+	} else if result.IPv6.Status == domain.ProbeStatusHealthy {
+		result.Status, result.ExitIP = domain.ProbeStatusHealthy, result.IPv6.ExitIP
+	}
+	if result.Status == domain.ProbeStatusHealthy {
+		return result, nil
+	}
+	errorsByFamily := make([]string, 0, 2)
+	if result.IPv4.Error != "" {
+		errorsByFamily = append(errorsByFamily, "IPv4: "+result.IPv4.Error)
+	}
+	if result.IPv6.Error != "" {
+		errorsByFamily = append(errorsByFamily, "IPv6: "+result.IPv6.Error)
+	}
+	result.Error = strings.Join(errorsByFamily, "; ")
+	if result.Error == "" {
+		result.Error = "IPv4 和 IPv6 代理探测均失败"
+	}
+	return result, errors.Join(ipv4Err, ipv6Err, errors.New(result.Error))
+}
+
+func (m *Manager) prepareEgressProbe(node domain.Node) (preparedEgressProbe, string, string, error) {
+	target := preparedEgressProbe{nodeID: node.ID, nodeName: node.Name, nodeScope: node.Scope}
+	if node.ID == 0 {
+		message := "代理节点 ID 无效"
+		return target, "validate_node", message, errors.New(message)
 	}
 	proxyURL, err := m.cipher.Decrypt(node.EncryptedProxyURL)
 	if err != nil {
-		result.Error = "读取代理配置失败"
-		return result, err
+		return target, "decrypt_proxy", "读取代理配置失败", err
 	}
 	proxyURL, err = application.NormalizeProxyURL(proxyURL)
 	if err != nil {
-		result.Error = "代理地址无效"
-		return result, err
+		return target, "normalize_proxy", "代理地址无效", err
 	}
 	if proxyURL == "" {
-		result.Error = "未配置代理地址"
-		return result, errors.New(result.Error)
+		message := "未配置代理地址"
+		return target, "normalize_proxy", message, errors.New(message)
 	}
 	if strings.Contains(proxyURL, application.ProxyAccountPlaceholder) {
 		proxyURL, err = renderAccountProxyURL(proxyURL, "egress_probe")
 		if err != nil {
-			result.Error = "账号代理模板无效"
-			return result, err
+			return target, "render_proxy_identity", "账号代理模板无效", err
 		}
 	}
-	client, err := newBuildClient(proxyURL, egressProbeTimeout)
+	target.proxyURL = proxyURL
+	return target, "", "", nil
+}
+
+func failedEgressProbeResult(provider domain.ProbeProvider, message string, startedAt time.Time) domain.ProbeResult {
+	completedAt := time.Now().UTC()
+	latencyMS := max(1, int(completedAt.Sub(startedAt).Milliseconds()))
+	family := domain.ProbeFamilyResult{
+		Status: domain.ProbeStatusUnhealthy, TestedAt: completedAt, LatencyMS: latencyMS, Error: message,
+	}
+	return domain.ProbeResult{
+		Status: domain.ProbeStatusUnhealthy, TestedAt: completedAt, LatencyMS: latencyMS, Error: message,
+		Provider: provider, IPv4: family, IPv6: family,
+	}
+}
+
+func (m *Manager) logProbeSetupFailure(ctx context.Context, node domain.Node, provider domain.ProbeProvider, stage, message string, err error, durationMS int) {
+	attributes := []any{
+		"node_id", node.ID, "node_name", node.Name, "scope", node.Scope,
+		"probe_provider", provider, "address_family", "all", "endpoint", "",
+		"stage", stage, "status_code", 0, "duration_ms", durationMS,
+		"connect_ms", 0, "tls_ms", 0, "first_byte_ms", 0,
+		"probe_error", message,
+	}
+	if err != nil {
+		attributes = append(attributes, "error", sanitizeFlareSolverrMessage(err.Error()))
+	}
+	m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
+}
+
+func probeEndpoints(provider domain.ProbeProvider) (string, string) {
+	if provider.Normalized() == domain.ProbeProviderCloudflare {
+		return cloudflareIPv4ProbeEndpoint, cloudflareIPv6ProbeEndpoint
+	}
+	return egressIPv4ProbeEndpoint, egressIPv6ProbeEndpoint
+}
+
+func (m *Manager) probeEgressEndpoint(ctx context.Context, target preparedEgressProbe, provider domain.ProbeProvider, family, targetURL string) (result domain.ProbeFamilyResult, probeErr error) {
+	startedAt := time.Now().UTC()
+	result = domain.ProbeFamilyResult{Status: domain.ProbeStatusUnhealthy, TestedAt: startedAt}
+	stage := "create_client"
+	statusCode := 0
+	var traceMu sync.Mutex
+	var connectStartedAt, tlsStartedAt time.Time
+	connectDone, connectFailed := false, false
+	tlsDone, tlsFailed := false, false
+	gotFirstByte := false
+	connectMS, tlsMS, firstByteMS := 0, 0, 0
+	defer func() {
+		completedAt := time.Now().UTC()
+		durationMS := max(1, int(completedAt.Sub(startedAt).Milliseconds()))
+		result.TestedAt = completedAt
+		if result.LatencyMS == 0 {
+			result.LatencyMS = durationMS
+		}
+		traceMu.Lock()
+		if !connectStartedAt.IsZero() && connectMS == 0 {
+			connectMS = max(1, int(time.Since(connectStartedAt).Milliseconds()))
+		}
+		if !tlsStartedAt.IsZero() && tlsMS == 0 {
+			tlsMS = max(1, int(time.Since(tlsStartedAt).Milliseconds()))
+		}
+		if stage == "first_byte" && firstByteMS == 0 {
+			firstByteMS = durationMS
+		}
+		connectDurationMS, tlsDurationMS, firstByteDurationMS := connectMS, tlsMS, firstByteMS
+		traceMu.Unlock()
+		attributes := []any{
+			"node_id", target.nodeID,
+			"node_name", target.nodeName,
+			"scope", target.nodeScope,
+			"probe_provider", provider,
+			"address_family", family,
+			"endpoint", targetURL,
+			"stage", stage,
+			"status_code", statusCode,
+			"duration_ms", durationMS,
+			"connect_ms", connectDurationMS,
+			"tls_ms", tlsDurationMS,
+			"first_byte_ms", firstByteDurationMS,
+		}
+		if probeErr != nil || result.Status != domain.ProbeStatusHealthy {
+			attributes = append(attributes, "probe_error", result.Error)
+			if probeErr != nil {
+				attributes = append(attributes, "error", sanitizeFlareSolverrMessage(probeErr.Error()))
+			}
+			m.log().WarnContext(ctx, "egress_probe_failed", attributes...)
+			return
+		}
+		attributes = append(attributes, "latency_ms", result.LatencyMS, "exit_ip", result.ExitIP)
+		m.log().InfoContext(ctx, "egress_probe_succeeded", attributes...)
+	}()
+	clientFactory := m.newBuildClient
+	if clientFactory == nil {
+		clientFactory = newBuildRequestClient
+	}
+	client, err := clientFactory(target.proxyURL, egressProbeTimeout)
 	if err != nil {
 		result.Error = "创建代理连接失败"
 		return result, err
@@ -327,45 +691,123 @@ func (m *Manager) probeEgressNode(ctx context.Context, nodeID uint64, targetURL 
 	defer client.CloseIdleConnections()
 	probeCtx, cancel := context.WithTimeout(ctx, egressProbeTimeout)
 	defer cancel()
+	probeCtx = httptrace.WithClientTrace(probeCtx, &httptrace.ClientTrace{
+		ConnectStart: func(_, _ string) {
+			traceMu.Lock()
+			if connectStartedAt.IsZero() {
+				connectStartedAt = time.Now()
+			}
+			traceMu.Unlock()
+		},
+		ConnectDone: func(_, _ string, traceErr error) {
+			traceMu.Lock()
+			connectDone = true
+			connectFailed = traceErr != nil
+			if !connectStartedAt.IsZero() && connectMS == 0 {
+				connectMS = max(1, int(time.Since(connectStartedAt).Milliseconds()))
+			}
+			traceMu.Unlock()
+		},
+		TLSHandshakeStart: func() {
+			traceMu.Lock()
+			if tlsStartedAt.IsZero() {
+				tlsStartedAt = time.Now()
+			}
+			traceMu.Unlock()
+		},
+		TLSHandshakeDone: func(_ tls.ConnectionState, traceErr error) {
+			traceMu.Lock()
+			tlsDone = true
+			tlsFailed = traceErr != nil
+			if !tlsStartedAt.IsZero() && tlsMS == 0 {
+				tlsMS = max(1, int(time.Since(tlsStartedAt).Milliseconds()))
+			}
+			traceMu.Unlock()
+		},
+		GotFirstResponseByte: func() {
+			traceMu.Lock()
+			gotFirstByte = true
+			if firstByteMS == 0 {
+				firstByteMS = max(1, int(time.Since(startedAt).Milliseconds()))
+			}
+			traceMu.Unlock()
+		},
+	})
+	stage = "build_request"
 	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		result.Error = "构造探测请求失败"
 		return result, err
 	}
 	request.Header.Set("User-Agent", DefaultUserAgent)
+	stage = "execute_request"
 	response, err := client.Do(request)
 	if err != nil {
+		traceMu.Lock()
+		switch {
+		case !connectStartedAt.IsZero() && (!connectDone || connectFailed):
+			stage = "connect"
+		case !tlsStartedAt.IsZero() && (!tlsDone || tlsFailed):
+			stage = "tls"
+		case (connectDone || tlsDone) && !gotFirstByte:
+			stage = "first_byte"
+		default:
+			stage = "execute_request"
+		}
+		traceMu.Unlock()
 		result.Error = "代理连接失败"
 		return result, err
 	}
+	statusCode = response.StatusCode
 	defer response.Body.Close()
+	stage = "read_response"
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 	if readErr != nil {
 		result.Error = "读取探测响应失败"
 		return result, readErr
 	}
+	stage = "validate_status"
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		result.Error = fmt.Sprintf("探测服务返回 HTTP %d", response.StatusCode)
 		return result, errors.New(result.Error)
 	}
-	var payload struct {
-		IP string `json:"ip"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
+	stage = "decode_response"
+	exitIP, err := decodeProbeIP(body)
+	if err != nil {
 		result.Error = "探测服务响应格式无效"
 		return result, err
 	}
-	address, err := netip.ParseAddr(strings.TrimSpace(payload.IP))
-	if err != nil {
-		result.Error = "探测服务未返回有效出口 IP"
+	stage = "validate_exit_ip"
+	address, err := netip.ParseAddr(exitIP)
+	if err != nil || (family == "ipv4" && !address.Is4()) || (family == "ipv6" && !address.Is6()) {
+		result.Error = fmt.Sprintf("探测服务未返回有效 %s 出口 IP", strings.ToUpper(family))
+		if err == nil {
+			err = errors.New(result.Error)
+		}
 		return result, err
 	}
 	result.Status = domain.ProbeStatusHealthy
-	result.TestedAt = time.Now().UTC()
 	result.LatencyMS = max(1, int(time.Since(startedAt).Milliseconds()))
 	result.ExitIP = address.String()
 	result.Error = ""
+	stage = "complete"
 	return result, nil
+}
+
+func decodeProbeIP(body []byte) (string, error) {
+	var payload struct {
+		IP string `json:"ip"`
+	}
+	if json.Unmarshal(body, &payload) == nil && strings.TrimSpace(payload.IP) != "" {
+		return strings.TrimSpace(payload.IP), nil
+	}
+	for line := range strings.SplitSeq(string(body), "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if found && key == "ip" && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value), nil
+		}
+	}
+	return "", errors.New("probe response does not contain an IP address")
 }
 
 func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity string, allowDirect bool, encryptedCredentialCookies string, boundNodeID uint64) (*Lease, bool, error) {
@@ -374,35 +816,50 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	configured := false
 	var available []domain.Node
 	if boundNodeID != 0 {
-		selected, err := m.repository.GetEgressNode(ctx, boundNodeID)
-		if err != nil {
-			primaryErr := fmt.Errorf("读取绑定出口节点: %w", err)
-			if !errors.Is(err, repository.ErrNotFound) {
-				return nil, true, primaryErr
+		waitedForProbe := false
+		qualityProbe := qualityProbeFromContext(ctx)
+		for {
+			now = time.Now().UTC()
+			selected, err := m.repository.GetEgressNode(ctx, boundNodeID)
+			if err != nil {
+				primaryErr := fmt.Errorf("读取绑定出口节点: %w", err)
+				if !errors.Is(err, repository.ErrNotFound) {
+					return nil, true, primaryErr
+				}
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
 			}
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
+			if !domain.SupportsScope(selected.Scope, scope) {
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
+			}
+			if !selected.Enabled && !qualityProbe {
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
+			}
+			if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 未配置代理地址", boundNodeID))
+			}
+			proxyPool := m.isProxyPoolNode(selected)
+			if !qualityProbe && !proxyPool && selected.CooldownUntil != nil && now.Before(*selected.CooldownUntil) {
+				if !waitedForProbe && selected.LastError == domain.LastErrorTransport {
+					completed, waitErr := m.waitForFailureProbe(ctx, boundNodeID)
+					if waitErr != nil {
+						return nil, true, waitErr
+					}
+					if completed {
+						waitedForProbe = true
+						continue
+					}
+				}
+				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 正在冷却", boundNodeID))
+			}
+			return m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
 		}
-		if !domain.SupportsScope(selected.Scope, scope) {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
-		}
-		if !selected.Enabled {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
-		}
-		if strings.TrimSpace(selected.EncryptedProxyURL) == "" {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 未配置代理地址", boundNodeID))
-		}
-		proxyPool := m.isProxyPoolNode(selected)
-		if !proxyPool && selected.CooldownUntil != nil && now.Before(*selected.CooldownUntil) {
-			return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 正在冷却", boundNodeID))
-		}
-		return m.leaseForNode(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected)
 	}
 	fallbackConfig, fallbackSupported, fallbackConfigErr := m.loadOperationsConfig(ctx, now)
 	fallback := domain.FallbackConfig{Mode: domain.FallbackModeNone}
-	reservedFallbackNodes := make(map[uint64]struct{}, 4)
+	reservedFallbackNodes := make(map[uint64]struct{}, len(allEgressScopes()))
 	if fallbackConfigErr == nil && fallbackSupported {
 		fallback = fallbackConfig.FallbackFor(scope)
-		for _, fallbackScope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+		for _, fallbackScope := range allEgressScopes() {
 			configuredFallback := fallbackConfig.FallbackFor(fallbackScope)
 			if configuredFallback.Mode == domain.FallbackModeFixed && configuredFallback.NodeID != 0 {
 				reservedFallbackNodes[configuredFallback.NodeID] = struct{}{}
@@ -612,9 +1069,18 @@ func fallbackError(primaryErr, fallbackErr error) error {
 	return fmt.Errorf("%w；出口回退不可用: %v", primaryErr, fallbackErr)
 }
 
+type clientOptions struct {
+	buildEnvironmentProxy   bool
+	requireAccountIsolation bool
+}
+
 func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity, encryptedCredentialCookies string, managedClearance bool, selected domain.Node) (*Lease, bool, error) {
+	return m.leaseForNodeWithOptions(ctx, scope, affinity, encryptedCredentialCookies, managedClearance, selected, clientOptions{})
+}
+
+func (m *Manager) leaseForNodeWithOptions(ctx context.Context, scope domain.Scope, affinity, encryptedCredentialCookies string, managedClearance bool, selected domain.Node, options clientOptions) (*Lease, bool, error) {
 	credentialCookies := ""
-	if !managedClearance && scope != domain.ScopeBuild && strings.TrimSpace(encryptedCredentialCookies) != "" {
+	if !managedClearance && usesBrowserClearance(scope) && strings.TrimSpace(encryptedCredentialCookies) != "" {
 		decryptedCookies, decryptErr := m.cipher.Decrypt(encryptedCredentialCookies)
 		if decryptErr != nil {
 			return nil, true, decryptErr
@@ -631,6 +1097,7 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 	}
 	sticky := strings.Contains(proxyURL, application.ProxyAccountPlaceholder)
 	proxyPool := selected.ProxyPool || sticky
+	freshTunnel := selected.ProxyPool && !sticky
 	if sticky {
 		accountKey := accountFromContext(ctx)
 		if accountKey == "" && strings.TrimSpace(affinity) != "" {
@@ -642,7 +1109,7 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 		}
 	}
 	cookies := ""
-	if scope != domain.ScopeBuild {
+	if usesBrowserClearance(scope) {
 		cookies, err = m.cipher.Decrypt(selected.EncryptedCloudflareCookie)
 		if err != nil {
 			// Managed mode can recover a damaged persisted cookie by asking the
@@ -675,18 +1142,33 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 			return nil, false, err
 		}
 	}
-	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky)
+	// Derive identity independently of the current toggle. clientFor applies one
+	// authoritative toggle snapshot, so enabling isolation between these two
+	// stages cannot accidentally place an account request in the shared bucket.
+	accountIdentity := ""
+	if scope != domain.ScopeConsoleAsset {
+		accountIdentity = isolationAccountIdentity(ctx, scope, affinity)
+	}
+	client, err := m.clientForWithOptions(selected.ID, scope, proxyURL, userAgent, cookies, sticky, accountIdentity, options)
 	if err != nil {
 		return nil, false, err
 	}
 	m.incrementInflight(selected.ID)
 	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""})
 	var once sync.Once
-	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
+	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, freshTunnel: freshTunnel, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
 		once.Do(func() {
 			m.decrementInflight(selected.ID)
 		})
 	}}, true, nil
+}
+
+// Console assets are served from public media hosts. They still need the
+// selected proxy and browser user agent, but forwarding account or node
+// clearance cookies would unnecessarily expose credentials to a different
+// origin and make an otherwise anonymous download depend on cookie storage.
+func usesBrowserClearance(scope domain.Scope) bool {
+	return scope != domain.ScopeBuild && scope != domain.ScopeConsoleAsset
 }
 
 func (m *Manager) inflightCounter(nodeID uint64) *atomic.Int64 {
@@ -836,6 +1318,9 @@ func fallbackScopes(scope domain.Scope) []domain.Scope {
 	if scope == domain.ScopeWebAsset {
 		return []domain.Scope{domain.ScopeWebAsset, domain.ScopeWeb}
 	}
+	if scope == domain.ScopeConsoleAsset {
+		return []domain.Scope{domain.ScopeConsoleAsset, domain.ScopeConsole, domain.ScopeWeb}
+	}
 	if scope == domain.ScopeConsole {
 		// Console uses the same browser/clearance surface as Grok Web. A
 		// dedicated Console node is preferred, but a Web node is a safe and
@@ -878,7 +1363,11 @@ func (m *Manager) inflightCount(nodeID uint64) int64 {
 	return 0
 }
 
-func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
+func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool, accountIdentity string) (cachedClient, error) {
+	return m.clientForWithOptions(id, scope, proxyURL, userAgent, cookies, sticky, accountIdentity, clientOptions{})
+}
+
+func (m *Manager) clientForWithOptions(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool, accountIdentity string, options clientOptions) (cachedClient, error) {
 	clientKind := "browser"
 	buildHeaderTimeout := time.Duration(0)
 	if scope == domain.ScopeBuild {
@@ -888,15 +1377,29 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 			buildHeaderTimeout = settingsdomain.DefaultBuildResponseHeaderTimeout
 		}
 		clientKind += "\x00" + strconv.FormatInt(int64(buildHeaderTimeout), 10)
+		if options.buildEnvironmentProxy {
+			clientKind += "\x00environment-proxy"
+		}
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies)))
 	cacheScope := scope
 	if cacheScope == domain.ScopeWebAsset {
 		cacheScope = domain.ScopeWeb
 	}
-	key := clientCacheKey{nodeID: id, scope: cacheScope, fingerprint: fingerprint}
-	loadKey := strconv.FormatUint(key.nodeID, 10) + "\x00" + string(key.scope) + "\x00" + key.fingerprint
 	for attempt := 0; attempt < clientCreationRetryLimit; attempt++ {
+		isolated := m.accountIsolated.Load()
+		if options.requireAccountIsolation && !isolated {
+			return cachedClient{}, errAccountConnectionIsolationDisabled
+		}
+		keyAccountIdentity := ""
+		if isolated {
+			keyAccountIdentity = strings.TrimSpace(accountIdentity)
+			if keyAccountIdentity == "" {
+				keyAccountIdentity = "shared"
+			}
+		}
+		key := clientCacheKey{nodeID: id, scope: cacheScope, fingerprint: fingerprint, accountIdentity: keyAccountIdentity}
+		loadKey := strconv.FormatUint(key.nodeID, 10) + "\x00" + string(key.scope) + "\x00" + key.fingerprint + "\x00" + key.accountIdentity
 		now := time.Now().UTC()
 		m.clientMu.RLock()
 		cached, cachedOK := m.clients[key]
@@ -920,7 +1423,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 		closeRequestClients(stale)
 
 		loaded, err, _ := m.clientLoads.Do(loadKey, func() (any, error) {
-			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout)
+			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout, options)
 		})
 		if errors.Is(err, errClientCacheInvalidated) {
 			continue
@@ -933,10 +1436,15 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	return cachedClient{}, errClientCacheInvalidated
 }
 
-func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration) (cachedClient, error) {
+func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration, options clientOptions) (cachedClient, error) {
 	now := time.Now().UTC()
 	m.clientMu.Lock()
 	stale := m.cleanupClientCacheLocked(now)
+	if (key.accountIdentity != "") != m.accountIsolated.Load() {
+		m.clientMu.Unlock()
+		closeRequestClients(stale)
+		return cachedClient{}, errClientCacheInvalidated
+	}
 	if cached, ok := m.clients[key]; ok {
 		cached.lastUsed = now
 		m.clients[key] = cached
@@ -948,7 +1456,7 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
 
-	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout)
+	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout, options)
 	if err != nil {
 		return cachedClient{}, err
 	}
@@ -956,6 +1464,11 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 
 	m.clientMu.Lock()
 	stale = m.cleanupClientCacheLocked(value.lastUsed)
+	if (key.accountIdentity != "") != m.accountIsolated.Load() {
+		m.clientMu.Unlock()
+		closeRequestClients(append(stale, value.client))
+		return cachedClient{}, errClientCacheInvalidated
+	}
 	if cached, ok := m.clients[key]; ok {
 		cached.lastUsed = value.lastUsed
 		m.clients[key] = cached
@@ -970,9 +1483,14 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	}
 	if id != 0 && !sticky {
 		for previousKey, previous := range m.clients {
-			if previousKey.nodeID == id {
-				stale = append(stale, m.evictClientLocked(previousKey, previous))
+			if previousKey.nodeID != id || previousKey.scope != key.scope {
+				continue
 			}
+			// Keep other accounts' pools when isolation is on.
+			if key.accountIdentity != "" && previousKey.accountIdentity != key.accountIdentity {
+				continue
+			}
+			stale = append(stale, m.evictClientLocked(previousKey, previous))
 		}
 	}
 	stale = append(stale, m.ensureClientCacheCapacityLocked()...)
@@ -982,8 +1500,19 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	return value, nil
 }
 
-func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration) (cachedClient, error) {
+func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration, options clientOptions) (cachedClient, error) {
 	if scope == domain.ScopeBuild {
+		if options.buildEnvironmentProxy {
+			factory := m.newBuildEnvClient
+			if factory == nil {
+				factory = newBuildEnvironmentRequestClient
+			}
+			client, err := factory(buildHeaderTimeout)
+			if err != nil {
+				return cachedClient{}, err
+			}
+			return cachedClient{client: client}, nil
+		}
 		factory := m.newBuildClient
 		if factory == nil {
 			factory = newBuildRequestClient
@@ -1007,6 +1536,10 @@ func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent stri
 
 func newBuildRequestClient(proxyURL string, responseHeaderTimeout time.Duration) (requestClient, error) {
 	return newBuildClient(proxyURL, responseHeaderTimeout)
+}
+
+func newBuildEnvironmentRequestClient(responseHeaderTimeout time.Duration) (requestClient, error) {
+	return newBuildEnvironmentClient(responseHeaderTimeout)
 }
 
 func (m *Manager) cleanupClientCacheLocked(now time.Time) []requestClient {
@@ -1084,6 +1617,19 @@ func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, trans
 }
 
 func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, nodeID uint64, status int, transportErr error) {
+	if status == clientClosedRequestStatus || errors.Is(transportErr, context.Canceled) {
+		return
+	}
+	// Console media hosts are public and do not use clearance credentials. A
+	// 403 there commonly describes the object URL (expired, rejected, or
+	// missing), not the proxy's ability to reach the origin, so it must not cool
+	// or rotate an otherwise healthy primary Console node.
+	if scope == domain.ScopeConsoleAsset && transportErr == nil && status == http.StatusForbidden {
+		return
+	}
+	if neterrorpkg.IsUpstreamStreamIdleTimeout(transportErr) {
+		return
+	}
 	if scope == domain.ScopeBuild && neterrorpkg.IsResponseHeaderTimeout(transportErr) {
 		return
 	}
@@ -1166,7 +1712,7 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
 		until := now.Add(cooldown)
 		value.CooldownUntil = &until
-		value.LastError = "transport error"
+		value.LastError = domain.LastErrorTransport
 		m.clientMu.Lock()
 		stale = m.invalidateClientLocked(nodeID)
 		m.clientMu.Unlock()
@@ -1179,11 +1725,17 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 	if stateRepository, ok := m.repository.(egressStateRepository); ok {
 		if err := stateRepository.UpdateEgressNodeHealth(ctx, value.ID, value.Health, value.FailureCount, value.CooldownUntil, value.LastError); err == nil {
 			m.invalidateNodes(value.Scope)
+			if transportErr != nil {
+				m.scheduleFailureProbe(value)
+			}
 		}
 		return
 	}
 	if _, err := m.repository.UpdateEgressNode(ctx, value); err == nil {
 		m.invalidateNodes(value.Scope)
+		if transportErr != nil {
+			m.scheduleFailureProbe(value)
+		}
 	}
 }
 
@@ -1225,7 +1777,7 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 		state.used = true
 		m.clearances[key] = state
 	}
-	if (!known || state.cookies == "") && persist && existingCookies != "" {
+	if (!known || state.userAgent == "") && persist && (existingCookies != "" || node.ClearanceRefreshedAt != nil) {
 		if !known {
 			m.ensureClearanceCacheCapacityLocked()
 		}
@@ -1240,7 +1792,10 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 		known = true
 		m.clearances[key] = state
 	}
-	fresh := known && !state.invalid && state.cookies != "" && state.version == version &&
+	// A successful solve may legitimately return no Cloudflare cookies when the
+	// selected egress does not trigger a challenge. The solver User-Agent marks
+	// that cookie-less result as complete so requests do not block on re-solving.
+	fresh := known && !state.invalid && state.userAgent != "" && state.version == version &&
 		state.fingerprint == fingerprint && (state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint) &&
 		!state.refreshedAt.IsZero() && now.Sub(state.refreshedAt) < interval
 	if fresh {
@@ -1250,9 +1805,14 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 		m.clearanceMu.Unlock()
 		return cookies, userAgent, nil
 	}
-	fallbackAllowed := known && !state.invalid && state.cookies != "" &&
+	fallbackAllowed := known && !state.invalid && state.userAgent != "" &&
 		(state.bindingFingerprint == "" || state.bindingFingerprint == bindingFingerprint)
 	fallback := clearanceSolution{Cookies: state.cookies, UserAgent: state.userAgent}
+	forceRefresh := known && state.invalid
+	refreshAfter := time.Time{}
+	if forceRefresh {
+		refreshAfter = state.refreshedAt
+	}
 	if fallbackAllowed {
 		state.lastUsedAt = now
 		m.clearances[key] = state
@@ -1264,7 +1824,7 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 	m.clearanceMu.Unlock()
 
 	result, err, _ := m.clearanceLoads.Do(key, func() (any, error) {
-		return m.refreshNode(ctx, node, proxyURL, key, persist, false, !fallbackAllowed)
+		return m.refreshNode(ctx, node, proxyURL, key, persist, forceRefresh, !fallbackAllowed, refreshAfter)
 	})
 	if err != nil {
 		if fallbackAllowed {
@@ -1276,7 +1836,7 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 	return solution.Cookies, solution.UserAgent, nil
 }
 
-func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, key string, persist, force, waitForPeer bool) (clearanceSolution, error) {
+func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, key string, persist, force, waitForPeer bool, refreshAfter time.Time) (clearanceSolution, error) {
 	m.clearanceMu.Lock()
 	cfg := m.clearanceConfig
 	solveVersion := m.clearanceVersion
@@ -1299,12 +1859,14 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 			return clearanceSolution{}, fmt.Errorf("协调 Clearance 刷新: %w", err)
 		}
 		if !acquired {
-			if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
-				m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
-				return solution, nil
+			if !force {
+				if solution, refreshedAt, ok := m.loadPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval); ok {
+					m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
+					return solution, nil
+				}
 			}
 			if waitForPeer {
-				if solution, refreshedAt, ok := m.waitPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval, timeout); ok {
+				if solution, refreshedAt, ok := m.waitPersistedClearance(ctx, node.ID, fingerprint, bindingFingerprint, interval, timeout, refreshAfter); ok {
 					m.cacheClearance(key, solution, refreshedAt, solveVersion, fingerprint, bindingFingerprint, interval)
 					return solution, nil
 				}
@@ -1357,7 +1919,7 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 	return solution, nil
 }
 
-func (m *Manager) waitPersistedClearance(ctx context.Context, nodeID uint64, fingerprint, bindingFingerprint string, interval, timeout time.Duration) (clearanceSolution, time.Time, bool) {
+func (m *Manager) waitPersistedClearance(ctx context.Context, nodeID uint64, fingerprint, bindingFingerprint string, interval, timeout time.Duration, refreshAfter time.Time) (clearanceSolution, time.Time, bool) {
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ticker := time.NewTicker(200 * time.Millisecond)
@@ -1367,7 +1929,8 @@ func (m *Manager) waitPersistedClearance(ctx context.Context, nodeID uint64, fin
 		case <-waitCtx.Done():
 			return clearanceSolution{}, time.Time{}, false
 		case <-ticker.C:
-			if solution, refreshedAt, ok := m.loadPersistedClearance(waitCtx, nodeID, fingerprint, bindingFingerprint, interval); ok {
+			if solution, refreshedAt, ok := m.loadPersistedClearance(waitCtx, nodeID, fingerprint, bindingFingerprint, interval); ok &&
+				(refreshAfter.IsZero() || refreshedAt.After(refreshAfter)) {
 				return solution, refreshedAt, true
 			}
 		}
@@ -1378,7 +1941,7 @@ func (m *Manager) loadPersistedClearance(ctx context.Context, nodeID uint64, fin
 	latest, err := m.repository.GetEgressNode(ctx, nodeID)
 	if err != nil || latest.ClearanceRefreshedAt == nil || latest.ClearanceFingerprint != fingerprint ||
 		(latest.ClearanceBindingFingerprint != "" && latest.ClearanceBindingFingerprint != bindingFingerprint) ||
-		time.Since(*latest.ClearanceRefreshedAt) >= interval || strings.TrimSpace(latest.EncryptedCloudflareCookie) == "" {
+		time.Since(*latest.ClearanceRefreshedAt) >= interval {
 		return clearanceSolution{}, time.Time{}, false
 	}
 	cookies, err := m.cipher.Decrypt(latest.EncryptedCloudflareCookie)
@@ -1387,7 +1950,7 @@ func (m *Manager) loadPersistedClearance(ctx context.Context, nodeID uint64, fin
 	}
 	cookies = application.SanitizeCloudflareCookies(cookies)
 	userAgent := strings.TrimSpace(latest.UserAgent)
-	if cookies == "" || userAgent == "" {
+	if userAgent == "" {
 		return clearanceSolution{}, time.Time{}, false
 	}
 	return clearanceSolution{Cookies: cookies, UserAgent: userAgent}, *latest.ClearanceRefreshedAt, true
@@ -1495,7 +2058,7 @@ func (m *Manager) recordClearanceError(ctx context.Context, node domain.Node, pe
 func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
 	if nodeID == 0 {
 		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
-			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, true, true)
+			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, true, true, time.Time{})
 		})
 		return err
 	}
@@ -1519,7 +2082,7 @@ func (m *Manager) RefreshClearance(ctx context.Context, nodeID uint64) error {
 	}
 	key := clearanceCacheKey(node.ID, proxyURL, false)
 	_, err, _ = m.clearanceLoads.Do(key, func() (any, error) {
-		return m.refreshNode(ctx, node, proxyURL, key, true, true, true)
+		return m.refreshNode(ctx, node, proxyURL, key, true, true, true, time.Time{})
 	})
 	return err
 }
@@ -1549,15 +2112,43 @@ func (m *Manager) InvalidateClearance(nodeID uint64) {
 // last-known-good cookie as invalid; ensureClearance will still verify its
 // binding before using it as a solver-failure fallback.
 func (m *Manager) ForgetClearance(nodeID uint64) {
+	m.ForgetClearances([]uint64{nodeID})
+}
+
+// ForgetClearances evicts a batch of node-scoped runtime state with one cache
+// scan and one lock acquisition. Administrative bulk updates can contain
+// thousands of nodes, so repeating the global snapshot invalidation per ID
+// would add avoidable lock contention and CPU work.
+func (m *Manager) ForgetClearances(nodeIDs []uint64) {
+	ids := make(map[uint64]struct{}, len(nodeIDs))
+	prefixes := make(map[string]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if _, exists := ids[nodeID]; exists {
+			continue
+		}
+		ids[nodeID] = struct{}{}
+		prefix := "node:" + strconv.FormatUint(nodeID, 10)
+		if nodeID == 0 {
+			prefix = "direct"
+		}
+		prefixes[prefix] = struct{}{}
+	}
+	if len(ids) == 0 {
+		return
+	}
 	m.clearanceMu.Lock()
 	m.nodeMu.Lock()
 	m.clientMu.Lock()
-	prefix := "node:" + strconv.FormatUint(nodeID, 10)
-	if nodeID == 0 {
-		prefix = "direct"
-	}
 	for key := range m.clearances {
-		if key == prefix || strings.HasPrefix(key, prefix+":") {
+		prefix := key
+		if strings.HasPrefix(key, "node:") {
+			if separator := strings.IndexByte(key[len("node:"):], ':'); separator >= 0 {
+				prefix = key[:len("node:")+separator]
+			}
+		} else if strings.HasPrefix(key, "direct:") {
+			prefix = "direct"
+		}
+		if _, selected := prefixes[prefix]; selected {
 			delete(m.clearances, key)
 		}
 	}
@@ -1567,12 +2158,22 @@ func (m *Manager) ForgetClearance(nodeID uint64) {
 	if m.nodeVersions == nil {
 		m.nodeVersions = make(map[domain.Scope]uint64)
 	}
-	for _, scope := range []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset} {
+	for _, scope := range allEgressScopes() {
 		m.nodeVersions[scope]++
 	}
 	clear(m.nodes)
 	clear(m.healthyNodes)
-	stale := m.invalidateClientLocked(nodeID)
+	var stale []requestClient
+	for nodeID := range ids {
+		m.invalidateClientVersionLocked(nodeID)
+	}
+	for key, cached := range m.clients {
+		if _, selected := ids[key.nodeID]; !selected {
+			continue
+		}
+		delete(m.clients, key)
+		stale = append(stale, cached.client)
+	}
 	m.clientMu.Unlock()
 	m.nodeMu.Unlock()
 	m.clearanceMu.Unlock()
@@ -1635,21 +2236,26 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 		m.clearanceMu.Unlock()
 		fingerprint := clearanceFingerprint(cfg, proxyURL)
 		memoryFresh := known && !state.invalid && state.version == version && state.fingerprint == fingerprint && now.Sub(state.refreshedAt) < interval
-		persistedFresh := node.ClearanceRefreshedAt != nil && node.ClearanceFingerprint == fingerprint && now.Sub(*node.ClearanceRefreshedAt) < interval
+		persistedFresh := (!known || !state.invalid) && node.ClearanceRefreshedAt != nil && node.ClearanceFingerprint == fingerprint && now.Sub(*node.ClearanceRefreshedAt) < interval
 		if !force && (memoryFresh || persistedFresh) {
 			continue
 		}
+		refreshForce := force || (known && state.invalid)
+		refreshAfter := time.Time{}
+		if refreshForce && known && state.invalid {
+			refreshAfter = state.refreshedAt
+		}
 		_, refreshErr, _ := m.clearanceLoads.Do(key, func() (any, error) {
-			return m.refreshNode(ctx, node, proxyURL, key, true, force, false)
+			return m.refreshNode(ctx, node, proxyURL, key, true, refreshForce, false, refreshAfter)
 		})
 		if refreshErr != nil {
 			refreshErrors = append(refreshErrors, refreshErr)
 		}
 	}
 	shouldUseDirect := direct.used || force && webNodeCount == 0
-	if shouldUseDirect && (force || direct.invalid || direct.cookies == "" || direct.version != version || now.Sub(direct.refreshedAt) >= interval) {
+	if shouldUseDirect && (force || direct.invalid || direct.userAgent == "" || direct.version != version || now.Sub(direct.refreshedAt) >= interval) {
 		_, err, _ := m.clearanceLoads.Do("direct", func() (any, error) {
-			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, force, false)
+			return m.refreshNode(ctx, domain.Node{Name: "direct", Scope: domain.ScopeWeb, Enabled: true}, "", "direct", false, force, false, time.Time{})
 		})
 		if err != nil {
 			refreshErrors = append(refreshErrors, err)
@@ -1660,6 +2266,10 @@ func (m *Manager) RefreshDueClearances(ctx context.Context, force bool) error {
 
 func isGrokWebScope(scope domain.Scope) bool {
 	return scope == domain.ScopeWeb || scope == domain.ScopeWebAsset || scope == domain.ScopeConsole
+}
+
+func allEgressScopes() []domain.Scope {
+	return []domain.Scope{domain.ScopeBuild, domain.ScopeWeb, domain.ScopeConsole, domain.ScopeWebAsset, domain.ScopeConsoleAsset}
 }
 
 func (m *Manager) isStickyProxyNode(value domain.Node) bool {
