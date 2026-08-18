@@ -52,6 +52,9 @@ database:
     # [按需修改] 根据数据库连接容量调整。
     maxOpenConns: 50
     maxIdleConns: 10
+    # [按需修改] 空闲连接最大存活时间；使用 Neon 免费版时建议不超过 5m，
+    # 以便计算节点在无活动时自动挂起，避免 CU-hour 超限。
+    connMaxIdleTime: 5m
 
 runtimeStore:
   # [按需修改] 单实例使用 memory；多实例改为 redis。

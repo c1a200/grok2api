@@ -53,7 +53,7 @@ const (
 	responseOwnershipCleanupBatchSize = 1000
 	webResponseStateCleanupBatchSize  = 50
 	responseCleanupMaxBatches         = 100
-	responseCleanupInterval           = 5 * time.Minute
+	responseCleanupInterval           = 6 * time.Minute
 	responseCleanupBudget             = 30 * time.Second
 	responseCleanupLockTTL            = 2 * time.Minute
 )
@@ -102,7 +102,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	case "sqlite":
 		database, err = relational.OpenSQLite(ctx, cfg.Database.SQLite.Path)
 	case "postgres":
-		database, err = relational.OpenPostgres(ctx, cfg.Database.Postgres.DSN, cfg.Database.Postgres.MaxOpenConns, cfg.Database.Postgres.MaxIdleConns)
+		database, err = relational.OpenPostgresWithIdleTimeout(ctx, cfg.Database.Postgres.DSN, cfg.Database.Postgres.MaxOpenConns, cfg.Database.Postgres.MaxIdleConns, cfg.Database.Postgres.ConnMaxIdleTime.Value())
 	default:
 		return nil, fmt.Errorf("不支持的数据库驱动: %s", cfg.Database.Driver)
 	}
@@ -536,13 +536,13 @@ func (a *Application) Run(ctx context.Context) error {
 		startBackground("invalidation_subscriber", a.invalidations.RunSubscriber)
 	}
 	startBackground("settings_reconcile", func(taskCtx context.Context) error {
-		a.runPeriodicTask(taskCtx, 30*time.Second, "settings_reconcile", func(runCtx context.Context) error {
+		a.runPeriodicTask(taskCtx, 6*time.Minute, "settings_reconcile", func(runCtx context.Context) error {
 			return a.settings.ReloadPersisted(runCtx)
 		})
 		return nil
 	})
 	startBackground("performance_metrics", func(taskCtx context.Context) error {
-		a.runPeriodicTask(taskCtx, time.Minute, "performance_metrics", func(context.Context) error {
+		a.runPeriodicTask(taskCtx, 6*time.Minute, "performance_metrics", func(context.Context) error {
 			a.logPerformanceMetrics()
 			return nil
 		})
@@ -626,7 +626,7 @@ func (a *Application) Run(ctx context.Context) error {
 		if err := a.egress.RefreshDueClearances(taskCtx, false); err != nil {
 			a.logger.Warn("clearance_initial_refresh_failed", "error", err)
 		}
-		a.runPeriodicTask(taskCtx, time.Minute, "clearance_refresh", func(runCtx context.Context) error {
+		a.runPeriodicTask(taskCtx, 6*time.Minute, "clearance_refresh", func(runCtx context.Context) error {
 			if err := a.egress.RefreshDueClearances(runCtx, false); err != nil {
 				a.logger.Warn("clearance_refresh_failed", "error", err)
 			}
@@ -638,7 +638,7 @@ func (a *Application) Run(ctx context.Context) error {
 		if err := a.egressOps.RunMaintenance(taskCtx); err != nil {
 			a.logger.Warn("egress_operations_initial_run_failed", "error", err)
 		}
-		a.runPeriodicTask(taskCtx, time.Minute, "egress_operations", a.egressOps.RunMaintenance)
+		a.runPeriodicTask(taskCtx, 6*time.Minute, "egress_operations", a.egressOps.RunMaintenance)
 		return nil
 	})
 	if a.settingsBus != nil {

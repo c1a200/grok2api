@@ -54,7 +54,7 @@ const (
 	forcedRefreshMinInterval        time.Duration = 30 * time.Second
 	paidProbeRetryInterval          time.Duration = 15 * time.Minute
 	credentialRefreshAdvance        time.Duration = 3 * time.Minute
-	credentialRefreshSafetyPoll     time.Duration = time.Minute
+	credentialRefreshSafetyPoll     time.Duration = 6 * time.Minute
 	credentialRefreshTimeout        time.Duration = 30 * time.Second
 	credentialRefreshStateTTL       time.Duration = 5 * time.Second
 	credentialStateWriteTimeout     time.Duration = 5 * time.Second

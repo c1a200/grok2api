@@ -18,8 +18,9 @@ import (
 
 // Database 持有关系型数据库连接和各仓储实现共享的 GORM 实例。
 type Database struct {
-	db      *gorm.DB
-	dialect string
+	db          *gorm.DB
+	dialect     string
+	connMaxIdle time.Duration
 }
 
 func (d *Database) Stats() sql.DBStats {
@@ -40,6 +41,10 @@ func (d *Database) Dialect() string {
 	return d.dialect
 }
 
+// defaultPostgresConnMaxIdleTime 是 PostgreSQL 空闲连接的默认最大存活时间。
+// 设置为 5 分钟，允许 Neon 等支持 auto-suspend 的数据库在无活动时自动挂起计算节点。
+const defaultPostgresConnMaxIdleTime = 5 * time.Minute
+
 // OpenSQLite 打开纯 Go SQLite 数据库并启用 WAL、外键与 busy timeout。
 // 显式事务使用 IMMEDIATE，避免并发读后写事务在锁升级时直接返回 SQLITE_BUSY。
 func OpenSQLite(ctx context.Context, path string) (*Database, error) {
@@ -51,7 +56,7 @@ func OpenSQLite(ctx context.Context, path string) (*Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite: %w", err)
 	}
-	return configureDatabase(ctx, db, "sqlite", 16, 16)
+	return configureDatabase(ctx, db, "sqlite", 16, 16, 5*time.Minute)
 }
 
 // OpenPostgres 打开 PostgreSQL 数据库并配置连接池。
@@ -60,7 +65,23 @@ func OpenPostgres(ctx context.Context, dsn string, maxOpenConns, maxIdleConns in
 	if err != nil {
 		return nil, &postgresConnectionError{operation: "打开 PostgreSQL", err: err, dsn: dsn}
 	}
-	database, err := configureDatabase(ctx, db, "postgres", maxOpenConns, maxIdleConns)
+	database, err := configureDatabase(ctx, db, "postgres", maxOpenConns, maxIdleConns, defaultPostgresConnMaxIdleTime)
+	if err != nil {
+		return nil, &postgresConnectionError{operation: "配置 PostgreSQL", err: err, dsn: dsn}
+	}
+	return database, nil
+}
+
+// OpenPostgresWithIdleTimeout 打开 PostgreSQL 数据库并使用自定义空闲连接超时。
+func OpenPostgresWithIdleTimeout(ctx context.Context, dsn string, maxOpenConns, maxIdleConns int, connMaxIdleTime time.Duration) (*Database, error) {
+	db, err := gorm.Open(postgres.Open(dsn), gormConfig())
+	if err != nil {
+		return nil, &postgresConnectionError{operation: "打开 PostgreSQL", err: err, dsn: dsn}
+	}
+	if connMaxIdleTime <= 0 {
+		connMaxIdleTime = defaultPostgresConnMaxIdleTime
+	}
+	database, err := configureDatabase(ctx, db, "postgres", maxOpenConns, maxIdleConns, connMaxIdleTime)
 	if err != nil {
 		return nil, &postgresConnectionError{operation: "配置 PostgreSQL", err: err, dsn: dsn}
 	}
@@ -104,7 +125,7 @@ func gormConfig() *gorm.Config {
 	}
 }
 
-func configureDatabase(ctx context.Context, db *gorm.DB, dialect string, maxOpenConns, maxIdleConns int) (*Database, error) {
+func configureDatabase(ctx context.Context, db *gorm.DB, dialect string, maxOpenConns, maxIdleConns int, connMaxIdleTime time.Duration) (*Database, error) {
 	sqlDB, err := db.DB()
 	if err != nil {
 		return nil, err
@@ -112,11 +133,12 @@ func configureDatabase(ctx context.Context, db *gorm.DB, dialect string, maxOpen
 	sqlDB.SetMaxOpenConns(maxOpenConns)
 	sqlDB.SetMaxIdleConns(maxIdleConns)
 	sqlDB.SetConnMaxLifetime(time.Hour)
+	sqlDB.SetConnMaxIdleTime(connMaxIdleTime)
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("连接 %s: %w", dialect, err)
 	}
-	return &Database{db: db, dialect: dialect}, nil
+	return &Database{db: db, dialect: dialect, connMaxIdle: connMaxIdleTime}, nil
 }
 
 // Close 关闭底层数据库连接。

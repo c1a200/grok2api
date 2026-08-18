@@ -110,9 +110,10 @@ type SQLiteDatabaseConfig struct {
 }
 
 type PostgresDatabaseConfig struct {
-	DSN          string `yaml:"dsn"`
-	MaxOpenConns int    `yaml:"maxOpenConns"`
-	MaxIdleConns int    `yaml:"maxIdleConns"`
+	DSN             string   `yaml:"dsn"`
+	MaxOpenConns    int      `yaml:"maxOpenConns"`
+	MaxIdleConns    int      `yaml:"maxIdleConns"`
+	ConnMaxIdleTime Duration `yaml:"connMaxIdleTime"`
 }
 
 type RuntimeStoreConfig struct {
@@ -465,6 +466,9 @@ func (c Config) Validate() error {
 		if c.Database.Postgres.MaxOpenConns < 1 || c.Database.Postgres.MaxOpenConns > 1000 || c.Database.Postgres.MaxIdleConns < 0 || c.Database.Postgres.MaxIdleConns > c.Database.Postgres.MaxOpenConns {
 			return errors.New("database.postgres 连接池配置无效")
 		}
+		if c.Database.Postgres.ConnMaxIdleTime.Value() <= 0 || c.Database.Postgres.ConnMaxIdleTime.Value() > time.Hour {
+			return errors.New("database.postgres.connMaxIdleTime 必须大于 0 且不超过 1 小时")
+		}
 	default:
 		return errors.New("database.driver 必须是 sqlite 或 postgres")
 	}
@@ -785,7 +789,7 @@ func defaultConfig() Config {
 		Database: DatabaseConfig{
 			Driver:   "sqlite",
 			SQLite:   SQLiteDatabaseConfig{Path: "./data/backend.db"},
-			Postgres: PostgresDatabaseConfig{MaxOpenConns: 50, MaxIdleConns: 10},
+			Postgres: PostgresDatabaseConfig{MaxOpenConns: 50, MaxIdleConns: 10, ConnMaxIdleTime: Duration(5 * time.Minute)},
 		},
 		RuntimeStore: RuntimeStoreConfig{
 			Driver: "memory",

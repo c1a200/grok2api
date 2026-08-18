@@ -15,7 +15,7 @@ const (
 	defaultRecoveryWorkers = 25
 	recoveryClaimLease     = 2 * time.Minute
 	recoveryProbeTimeout   = 30 * time.Second
-	recoveryReconcileEvery = time.Minute
+	recoveryReconcileEvery = 6 * time.Minute
 	recoveryReconcileLimit = 1000
 	consoleProbeInterval   = 24 * time.Hour
 )
